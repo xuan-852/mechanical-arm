@@ -18,6 +18,7 @@ typedef struct
 } FLASH_EraseInitTypeDef;
 
 void     HAL_Delay(uint32_t ms);
+uint32_t HAL_GetTick(void);
 uint32_t HAL_FLASH_Unlock(void);
 uint32_t HAL_FLASH_Lock(void);
 uint32_t HAL_FLASHEx_Erase(FLASH_EraseInitTypeDef *pEraseInit, uint32_t *PageError);

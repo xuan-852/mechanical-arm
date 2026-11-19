@@ -29,6 +29,7 @@ virtualFolder:
                 - path: ../Core/Src/robot.c
                 - path: ../Core/Src/protocol.c
                 - path: ../Core/Src/cfg_store.c
+                - path: ../Core/Src/pin_probe.c
                 - path: ../Core/Src/zmotord.c
                 - path: ../Core/Src/stm32f1xx_it.c
                 - path: ../Core/Src/stm32f1xx_hal_msp.c

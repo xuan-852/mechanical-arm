@@ -53,11 +53,18 @@ CMD_SAVE_CFG = 0x0C
 CMD_RESET_CFG = 0x0D
 CMD_DRIVE_BASE = 0x0E
 CMD_DRIVE_WHEELS = 0x0F
+CMD_TRACK_MODE = 0x10
+CMD_TRACK_CFG = 0x11
+CMD_READ_TRACK = 0x12
 
 CMD_ACK = 0x80
 CMD_POSE = 0x81
 CMD_NAK = 0x82
 CMD_JOINT_CFG = 0x83
+CMD_TRACK_STAT = 0x84
+
+TRACK_MODES = {0: "OFF", 1: "ACTIVE", 2: "AUTO"}
+TRACK_STATES = {0: "IDLE", 1: "FOLLOW", 2: "JUNCTION", 3: "SEARCH", 4: "LOST"}
 
 STATUS = {
     0x00: "OK",
@@ -208,7 +215,7 @@ class Robot:
         if frame is None:
             return None, None, "timeout (no reply -- check wiring/baud/NVIC)"
         rcmd, rpayload = frame
-        if rcmd in (CMD_POSE, CMD_JOINT_CFG):
+        if rcmd in (CMD_POSE, CMD_JOINT_CFG, CMD_TRACK_STAT):
             return rcmd, rpayload, None
         if rcmd in (CMD_ACK, CMD_NAK) and len(rpayload) == 2:
             orig, status = rpayload
@@ -266,6 +273,33 @@ class Robot:
                               pulse_min_us, pulse_max_us, invert)
         return self.request(CMD_SET_JOINT_CFG, payload)[2]
 
+    def set_track_mode(self, mode: int, dry_run: int = 0):
+        return self.request(CMD_TRACK_MODE, struct.pack("<2B", mode, dry_run))[2]
+
+    def set_track_cfg(self, vx_cruise: int, vx_min: int, kp: int, kd: int,
+                      k_ang: int, wz_max: int, search_wz: int):
+        payload = struct.pack("<2h5H", vx_cruise, vx_min, kp, kd, k_ang,
+                              wz_max, search_wz)
+        return self.request(CMD_TRACK_CFG, payload)[2]
+
+    def track_status(self):
+        rcmd, payload, err = self.request(CMD_READ_TRACK, b"")
+        if err or rcmd != CMD_TRACK_STAT or len(payload) != 16:
+            return None, err or "bad track stat reply"
+        mode, dry, st, val, err_v, ang_v, vx, wz, age, rx = struct.unpack("<4B4h2H", payload)
+        return {
+            "mode": TRACK_MODES.get(mode, str(mode)),
+            "dry_run": bool(dry),
+            "state": TRACK_STATES.get(st, str(st)),
+            "valid": val,
+            "err": err_v,
+            "ang": ang_v,
+            "vx": vx,
+            "wz": wz,
+            "age_ms": age,
+            "rx_frames": rx,
+        }, None
+
 
 # --- offline checks --------------------------------------------------------
 
@@ -313,6 +347,12 @@ def run_checks() -> int:
     check("DRIVE_WHEELS length", len(whl), 2 + 1 + 1 + 10 + 1)
     gcfg = build_frame(CMD_GET_JOINT_CFG, bytes([2]))
     check("GET_JOINT_CFG length", len(gcfg), 6)
+    tmode = build_frame(CMD_TRACK_MODE, struct.pack("<2B", 1, 0))
+    check("TRACK_MODE length", len(tmode), 7)
+    tcfg = build_frame(CMD_TRACK_CFG, struct.pack("<2h5H", 600, 420, 38, 160, 20, 320, 320))
+    check("TRACK_CFG length", len(tcfg), 19)
+    tread = build_frame(CMD_READ_TRACK)
+    check("READ_TRACK length", len(tread), 5)
 
     print("PASS" if failures == 0 else f"{failures} FAILURE(S)")
     return 1 if failures else 0
@@ -662,6 +702,57 @@ def cmd_cfg_reset(robot: Robot, args):
     return 1 if err else 0
 
 
+def cmd_track(robot: Robot, args):
+    act = args.action
+    if act in ("off", "stop"):
+        err = robot.set_track_mode(0, 0)
+        print("ERROR: " + err if err else "line tracking OFF")
+        return 1 if err else 0
+    if act == "start":
+        err = robot.set_track_mode(1, 0)
+        print("ERROR: " + err if err else "line tracking ACTIVE (live driving)")
+        return 1 if err else 0
+    if act == "dry":
+        err = robot.set_track_mode(1, 1)
+        print("ERROR: " + err if err else "line tracking ACTIVE (DRY RUN, motors off)")
+        return 1 if err else 0
+    if act == "auto":
+        err = robot.set_track_mode(2, 0)
+        print("ERROR: " + err if err else "line tracking AUTO (arms on OpenMV arm=1)")
+        return 1 if err else 0
+    if act == "tune":
+        err = robot.set_track_cfg(args.vx, args.vmin, args.kp, args.kd,
+                                  args.kang, args.wmax, args.swz)
+        print("ERROR: " + err if err else
+              f"track cfg updated vx={args.vx}..{args.vmin} kp={args.kp} "
+              f"kd={args.kd} kang={args.kang} wmax={args.wmax} swz={args.swz}")
+        return 1 if err else 0
+    if act == "status":
+        st, err = robot.track_status()
+        if err:
+            print(f"ERROR: {err}")
+            return 1
+        print(st)
+        return 0
+    if act == "monitor":
+        print("monitoring OpenMV line tracking (Ctrl-C to stop)")
+        try:
+            while True:
+                st, err = robot.track_status()
+                if err:
+                    print(f"  ERROR: {err}")
+                else:
+                    print(f"  [{st['mode']:<6}{' DRY' if st['dry_run'] else ''}] "
+                          f"{st['state']:<8} valid={st['valid']} err={st['err']:+5d} "
+                          f"ang={st['ang']:+4d} vx={st['vx']:+4d} wz={st['wz']:+4d} "
+                          f"age={st['age_ms']}ms rx={st['rx_frames']}")
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nstopped")
+        return 0
+    return 1
+
+
 # --- cli -------------------------------------------------------------------
 
 def main(argv=None) -> int:
@@ -736,6 +827,17 @@ def main(argv=None) -> int:
     sub.add_parser("cfg-save", help="save calibration to flash")
     sub.add_parser("cfg-reset", help="erase flash calibration")
 
+    p = sub.add_parser("track", help="OpenMV black-line tracking control & tuning")
+    p.add_argument("action",
+                   choices=("start", "stop", "off", "auto", "dry", "status", "monitor", "tune"))
+    p.add_argument("--vx", type=int, default=600, help="straight cruise speed (default 600)")
+    p.add_argument("--vmin", type=int, default=420, help="min curve speed (default 420)")
+    p.add_argument("--kp", type=int, default=38, help="proportional turn gain (default 38)")
+    p.add_argument("--kd", type=int, default=160, help="derivative damping (default 160)")
+    p.add_argument("--kang", type=int, default=20, help="curve slope lead (default 20)")
+    p.add_argument("--wmax", type=int, default=320, help="max angular rate (default 320)")
+    p.add_argument("--swz", type=int, default=320, help="lost-line spin speed (default 320)")
+
     args = ap.parse_args(argv)
 
     if args.check:
@@ -764,6 +866,7 @@ def main(argv=None) -> int:
         "cfg-get": cmd_cfg_get,
         "cfg-save": cmd_cfg_save,
         "cfg-reset": cmd_cfg_reset,
+        "track": cmd_track,
     }
 
     if args.command == "scan":

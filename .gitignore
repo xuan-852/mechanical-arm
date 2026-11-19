@@ -19,3 +19,6 @@ tools/*.exe
 tools/__pycache__/
 __pycache__/
 *.pyc
+
+# Local OpenMV field-run recordings
+openmv/*.mp4

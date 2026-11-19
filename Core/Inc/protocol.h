@@ -47,12 +47,16 @@ extern "C" {
 #define CMD_RESET_CFG      0x0Du   /* no payload: erase stored calibration     */
 #define CMD_DRIVE_BASE     0x0Eu   /* payload: vx, vy, wz (i16), time_ms (u16) */
 #define CMD_DRIVE_WHEELS   0x0Fu   /* payload: fl, fr, rl, rr (i16), time (u16)*/
+#define CMD_TRACK_MODE     0x10u   /* payload: mode(u8), dry_run(u8)           */
+#define CMD_TRACK_CFG      0x11u   /* payload: 7 x u16/i16 track tuning (14B)  */
+#define CMD_READ_TRACK     0x12u   /* no payload -> CMD_TRACK_STAT             */
 
 /* Robot -> host */
 #define CMD_ACK            0x80u   /* payload: cmd, status                */
 #define CMD_POSE           0x81u   /* payload: 6 x int16 (0.1 deg)        */
 #define CMD_NAK            0x82u   /* payload: cmd, status                */
 #define CMD_JOINT_CFG      0x83u   /* payload: joint + cfg (12 bytes)     */
+#define CMD_TRACK_STAT     0x84u   /* payload: track_status_t (16 bytes)  */
 
 /* Status codes */
 #define ST_OK              0x00u

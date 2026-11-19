@@ -18,6 +18,7 @@
 #include "usart.h"
 #include "robot.h"
 #include "zmotord.h"
+#include "line_track.h"
 
 typedef enum
 {
@@ -298,6 +299,7 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
     {
       if (len != 8u)                       { send_ack(cmd, ST_BAD_LEN); return; }
       if (ROBOT_GetState() == ROBOT_ESTOP) { send_ack(cmd, ST_ESTOP);   return; }
+      TRACK_ForceOff();
       ZM_DriveMecanum(rd_s16(pl, 0u), rd_s16(pl, 1u), rd_s16(pl, 2u), rd16(&pl[6]));
       send_ack(cmd, ST_OK);
       break;
@@ -307,9 +309,64 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
     {
       if (len != 10u)                      { send_ack(cmd, ST_BAD_LEN); return; }
       if (ROBOT_GetState() == ROBOT_ESTOP) { send_ack(cmd, ST_ESTOP);   return; }
+      TRACK_ForceOff();
       ZM_SetWheels(rd_s16(pl, 0u), rd_s16(pl, 1u), rd_s16(pl, 2u), rd_s16(pl, 3u),
                    rd16(&pl[8]));
       send_ack(cmd, ST_OK);
+      break;
+    }
+
+    case CMD_TRACK_MODE:
+    {
+      if (len != 2u) { send_ack(cmd, ST_BAD_LEN); return; }
+      if (TRACK_SetMode(pl[0], pl[1]) != 0)
+      {
+        send_ack(cmd, (ROBOT_GetState() == ROBOT_ESTOP) ? ST_ESTOP : ST_LIMIT);
+        return;
+      }
+      send_ack(cmd, ST_OK);
+      break;
+    }
+
+    case CMD_TRACK_CFG:
+    {
+      track_cfg_t c;
+
+      if (len != 14u) { send_ack(cmd, ST_BAD_LEN); return; }
+
+      c.vx_cruise = (int16_t)rd16(&pl[0]);
+      c.vx_min    = (int16_t)rd16(&pl[2]);
+      c.kp        = rd16(&pl[4]);
+      c.kd        = rd16(&pl[6]);
+      c.k_ang     = rd16(&pl[8]);
+      c.wz_max    = rd16(&pl[10]);
+      c.search_wz = rd16(&pl[12]);
+
+      if (TRACK_SetConfig(&c) != 0) { send_ack(cmd, ST_LIMIT); return; }
+      send_ack(cmd, ST_OK);
+      break;
+    }
+
+    case CMD_READ_TRACK:
+    {
+      track_status_t st;
+      uint8_t p[16];
+
+      if (len != 0u) { send_ack(cmd, ST_BAD_LEN); return; }
+
+      TRACK_GetStatus(&st);
+      p[0] = st.mode;
+      p[1] = st.dry_run;
+      p[2] = st.state;
+      p[3] = st.valid;
+      wr16(&p[4],  st.err);
+      wr16(&p[6],  st.ang);
+      wr16(&p[8],  st.vx_cmd);
+      wr16(&p[10], st.wz_cmd);
+      wr16(&p[12], (int16_t)st.age_ms);
+      wr16(&p[14], (int16_t)st.rx_frames);
+
+      send_frame(CMD_TRACK_STAT, p, 16u);
       break;
     }
 

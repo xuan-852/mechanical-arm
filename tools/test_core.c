@@ -28,6 +28,7 @@
 #include "protocol.h"
 #include "cfg_store.h"
 #include "zmotord.h"
+#include "line_track.h"
 #include "bsp_pwm.h"
 #include "usart.h"
 #include "main.h"
@@ -46,6 +47,10 @@ static uint16_t g_rx_head, g_rx_tail;
 
 static uint8_t  g_zm_tx[512];
 static uint16_t g_zm_tx_len;
+
+static uint8_t  g_zm_rx[256];
+static uint16_t g_zm_rx_head, g_zm_rx_tail;
+static uint32_t g_fake_tick_ms;
 
 static uint8_t  g_fake_flash[CFG_PAGE_SIZE];
 static uint8_t  g_flash_locked = 1u;
@@ -90,6 +95,19 @@ void ZM_SendRaw(const uint8_t *buf, uint16_t len)
     memcpy(&g_zm_tx[g_zm_tx_len], buf, len);
     g_zm_tx_len = (uint16_t)(g_zm_tx_len + len);
   }
+}
+
+int ZM_ReadByte(uint8_t *out)
+{
+  if ((out == NULL) || (g_zm_rx_head == g_zm_rx_tail)) { return -1; }
+  *out = g_zm_rx[g_zm_rx_tail++];
+  if (g_zm_rx_tail >= (uint16_t)sizeof(g_zm_rx)) { g_zm_rx_tail = 0u; }
+  return 0;
+}
+
+uint32_t HAL_GetTick(void)
+{
+  return g_fake_tick_ms;
 }
 
 uint16_t BSP_PWM_SetPulse(uint8_t ch, uint16_t pulse_us)
@@ -689,6 +707,133 @@ static void test_selftest_delta(void)
   SERVO_GoHome();
 }
 
+static void push_zm_rx(const char *s)
+{
+  while (*s != '\0')
+  {
+    g_zm_rx[g_zm_rx_head++] = (uint8_t)(*s++);
+    if (g_zm_rx_head >= (uint16_t)sizeof(g_zm_rx)) { g_zm_rx_head = 0u; }
+  }
+}
+
+static void feed_omv_pkt(int err, int ang, int valid, int arm)
+{
+  char body[40];
+  char full[52];
+  uint8_t csum = 0u;
+  int n = sprintf(body, "L,%d,%d,%d,%d", err, ang, valid, arm);
+  for (int i = 0; i < n; i++) { csum ^= (uint8_t)body[i]; }
+  sprintf(full, "@%s*%02X\n", body, csum);
+  push_zm_rx(full);
+}
+
+static void test_line_tracking(void)
+{
+  printf("OpenMV @L line tracking & protocol\n");
+
+  g_fake_tick_ms = 100u;
+  TRACK_Init();
+  reset_zm();
+
+  /* Bench preview arm=0 updates telemetry without moving wheels */
+  feed_omv_pkt(-400, -10, 1, 0);
+  TRACK_Poll();
+  track_status_t st;
+  TRACK_GetStatus(&st);
+  check("arm=0 parses @L without driving",
+        st.rx_frames == 1u && st.err == -400 && st.ang == -10 &&
+        st.state == TRACK_ST_IDLE && g_zm_tx_len == 0u, NULL);
+
+  /* Corrupt checksum & motor echo strings must be ignored */
+  push_zm_rx("#006P1500T0000!@L,999,0,1,1*00\n");
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
+  check("bad checksum & motor echo rejected",
+        st.rx_frames == 1u && st.err == -400, NULL);
+
+  /* Autonomous arm=1 left curve (err<0 -> turn left wz>0 -> vx_R > vx_L) */
+  g_fake_tick_ms = 150u;
+  feed_omv_pkt(-400, -10, 1, 1);
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
+  check("err<0 produces positive wz (turn left) and reduced vx",
+        st.state == TRACK_ST_FOLLOW && st.wz_cmd > 0 &&
+        st.vx_cmd >= 400 && st.vx_cmd < 600 && g_zm_tx_len == 60u, NULL);
+
+  /* Switch to right offset (err>0 -> turn right wz<0) */
+  g_fake_tick_ms = 200u;
+  reset_zm();
+  feed_omv_pkt(500, 15, 1, 1);
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
+  check("err>0 produces negative wz (turn right)",
+        st.state == TRACK_ST_FOLLOW && st.wz_cmd < 0 && g_zm_tx_len == 60u, NULL);
+
+  /* Lost line spins toward last seen side (+direction = right -> wz<0), then stops */
+  g_fake_tick_ms = 260u;
+  reset_zm();
+  feed_omv_pkt(500, 0, 0, 1);
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
+  check("lost line enters SEARCH spinning toward last side",
+        st.state == TRACK_ST_SEARCH && st.vx_cmd == 0 && st.wz_cmd < 0, NULL);
+
+  g_fake_tick_ms = 1600u;
+  feed_omv_pkt(500, 0, 0, 1);
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
+  check("lost line timeout transitions to LOST and stops wheels",
+        st.state == TRACK_ST_LOST && st.vx_cmd == 0 && st.wz_cmd == 0, NULL);
+
+  /* Host CMD_TRACK_CFG & CMD_TRACK_MODE dry-run + CMD_READ_TRACK */
+  uint8_t pl[14];
+  put_s16(pl, 0u, 320);  /* vx_cruise */
+  put_s16(pl, 1u, 180);  /* vx_min */
+  put_s16(pl, 2u, 70);   /* kp */
+  put_s16(pl, 3u, 30);   /* kd */
+  put_s16(pl, 4u, 45);   /* k_ang */
+  put_s16(pl, 5u, 450);  /* wz_max */
+  put_s16(pl, 6u, 250);  /* search_wz */
+  uint8_t f[32];
+  reset_log();
+  feed(f, frame(f, CMD_TRACK_CFG, pl, 14u));
+  uint8_t ack[20];
+  check("CMD_TRACK_CFG ACK", find_reply(CMD_ACK, ack) == 2 && ack[1] == ST_OK, NULL);
+
+  uint8_t mode_pl[2] = { 1u, 1u }; /* ACTIVE, dry_run=1 */
+  reset_log();
+  feed(f, frame(f, CMD_TRACK_MODE, mode_pl, 2u));
+  check("CMD_TRACK_MODE ACK", find_reply(CMD_ACK, ack) == 2 && ack[1] == ST_OK, NULL);
+
+  g_fake_tick_ms = 1700u;
+  reset_zm();
+  feed_omv_pkt(-300, 0, 1, 0);
+  TRACK_Poll();
+  check("dry-run never emits motor frames", g_zm_tx_len == 0u, NULL);
+
+  reset_log();
+  feed(f, frame(f, CMD_READ_TRACK, NULL, 0u));
+  check("CMD_READ_TRACK replies CMD_TRACK_STAT (16B)",
+        find_reply(CMD_TRACK_STAT, ack) == 16 && ack[0] == 1u && ack[1] == 1u &&
+        get_s16(&ack[4], 0u) == -300 && get_s16(&ack[4], 3u) > 0, NULL);
+
+  /* Heartbeat timeout stops active drive */
+  uint8_t live_pl[2] = { 1u, 0u };
+  feed(f, frame(f, CMD_TRACK_MODE, live_pl, 2u));
+  g_fake_tick_ms = 1750u;
+  feed_omv_pkt(-200, 0, 1, 0);
+  TRACK_Poll();
+  reset_zm();
+  g_fake_tick_ms = 2200u; /* > 350ms without OpenMV packet */
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
+  check("OpenMV RX timeout stops wheels & resets state",
+        st.state == TRACK_ST_IDLE && g_zm_tx_len >= 60u &&
+        memcmp(g_zm_tx, "#006P1500T0000!", 15u) == 0, NULL);
+
+  TRACK_Init();
+}
+
 int main(void)
 {
   printf("firmware core test\n\n");
@@ -710,6 +855,7 @@ int main(void)
   test_cfg_persistence_and_busy();
   test_zmotord_mecanum();
   test_selftest_delta();
+  test_line_tracking();
 
   printf("\n%s\n", g_fail == 0 ? "PASS" : "FAILURES PRESENT");
   return (g_fail == 0) ? 0 : 1;

@@ -443,6 +443,11 @@
               <FilePath>../Core/Src/zmotord.c</FilePath>
             </File>
             <File>
+              <FileName>line_track.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/line_track.c</FilePath>
+            </File>
+            <File>
               <FileName>stm32f1xx_it.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_it.c</FilePath>

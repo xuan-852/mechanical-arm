@@ -27,6 +27,7 @@
 #include "robot.h"
 #include "protocol.h"
 #include "zmotord.h"
+#include "line_track.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -95,6 +96,7 @@ int main(void)
   ROBOT_Init();
   ZM_Init(ZM_BUS_DUPLEX, ZM_DEFAULT_BAUD);
   ZM_StopAll();
+  TRACK_Init();
   PROTO_Init();
 
 #if ROBOT_BOOT_SELFTEST
@@ -111,6 +113,7 @@ int main(void)
   while (1)
   {
     PROTO_Poll();
+    TRACK_Poll();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
