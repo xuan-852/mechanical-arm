@@ -1,0 +1,21 @@
+# Build outputs & IDE generated artifacts
+.mxproject
+MDK-ARM/.cmsis/
+MDK-ARM/robot/
+MDK-ARM/build/
+MDK-ARM/DebugConfig/
+MDK-ARM/RTE/
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.lst
+MDK-ARM/build_out.txt
+MDK-ARM/rb_feedback.txt
+MDK-ARM/JLinkLog.txt
+MDK-ARM/JLinkSettings.ini
+MDK-ARM/.vscode/keil-assistant.log
+MDK-ARM/.vscode/uv4.log.lock
+
+# Host test binaries & Python caches
+tools/*.exe
+tools/__pycache__/
+__pycache__/
+*.pyc
