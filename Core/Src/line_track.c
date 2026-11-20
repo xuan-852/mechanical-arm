@@ -5,6 +5,7 @@
   ******************************************************************************
   */
 #include "line_track.h"
+#include "cube_pick.h"
 #include "zmotord.h"
 #include "robot.h"
 #include "main.h"
@@ -133,7 +134,8 @@ static void parse_line(uint32_t now_ms)
   uint8_t xor_calc = 0u;
   int hi, lo;
 
-  if ((s_line_len < 11u) || (s_line[0] != 'L') || (s_line[1] != ','))
+  if ((s_line_len < 11u) || (s_line[1] != ',') ||
+      ((s_line[0] != 'L') && (s_line[0] != 'O')))
   {
     return;
   }
@@ -166,6 +168,12 @@ static void parse_line(uint32_t now_ms)
 
   s_line[star] = '\0';
   p = &s_line[2];
+
+  if (s_line[0] == 'O')
+  {
+    PICK_OnFrame(p, now_ms);
+    return;
+  }
 
   if (parse_i32_field(&p, &err_v) != 0 || *p != ',') { return; }
   p++;

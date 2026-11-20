@@ -448,6 +448,11 @@
               <FilePath>../Core/Src/line_track.c</FilePath>
             </File>
             <File>
+              <FileName>cube_pick.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/cube_pick.c</FilePath>
+            </File>
+            <File>
               <FileName>stm32f1xx_it.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_it.c</FilePath>

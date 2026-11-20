@@ -28,6 +28,7 @@
 #include "protocol.h"
 #include "zmotord.h"
 #include "line_track.h"
+#include "cube_pick.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -97,6 +98,7 @@ int main(void)
   ZM_Init(ZM_BUS_DUPLEX, ZM_DEFAULT_BAUD);
   ZM_StopAll();
   TRACK_Init();
+  PICK_Init();
   PROTO_Init();
 
 #if ROBOT_BOOT_SELFTEST
@@ -114,6 +116,7 @@ int main(void)
   {
     PROTO_Poll();
     TRACK_Poll();
+    PICK_Poll();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

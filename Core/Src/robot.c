@@ -9,6 +9,7 @@
 #include "bsp_pwm.h"
 #include "zmotord.h"
 #include "line_track.h"
+#include "cube_pick.h"
 #include "main.h"
 #include <stddef.h>
 
@@ -153,6 +154,7 @@ void ROBOT_Stop(void)
 
   __set_PRIMASK(primask);
   TRACK_ForceOff();
+  PICK_ForceOff();
   ZM_StopAll();
 }
 
@@ -162,6 +164,7 @@ void ROBOT_EmergencyStop(void)
      under gravity. Freezing the last frame is the safe behaviour. */
   s_state = ROBOT_ESTOP;
   TRACK_ForceOff();
+  PICK_ForceOff();
   ZM_StopAll();
 }
 

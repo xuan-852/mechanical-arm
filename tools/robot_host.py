@@ -56,15 +56,25 @@ CMD_DRIVE_WHEELS = 0x0F
 CMD_TRACK_MODE = 0x10
 CMD_TRACK_CFG = 0x11
 CMD_READ_TRACK = 0x12
+CMD_PICK_MODE = 0x13
+CMD_READ_PICK = 0x14
 
 CMD_ACK = 0x80
 CMD_POSE = 0x81
 CMD_NAK = 0x82
 CMD_JOINT_CFG = 0x83
 CMD_TRACK_STAT = 0x84
+CMD_PICK_STAT = 0x85
 
 TRACK_MODES = {0: "OFF", 1: "ACTIVE", 2: "AUTO"}
 TRACK_STATES = {0: "IDLE", 1: "FOLLOW", 2: "JUNCTION", 3: "SEARCH", 4: "LOST"}
+PICK_MODES = {0: "OFF", 1: "ACTIVE", 2: "AUTO", 3: "RESET"}
+PICK_STATES = {
+    0: "IDLE", 1: "SEARCH", 2: "APPROACH", 3: "ALIGN",
+    4: "ARM_WAKE", 5: "ARM_PRE", 6: "ARM_ABOVE", 7: "ARM_GRAB",
+    8: "ARM_CLAMP", 9: "ARM_LIFT", 10: "ARM_RETRACT", 11: "ARM_HOME",
+    12: "HOLDING", 13: "FAIL",
+}
 
 STATUS = {
     0x00: "OK",
@@ -300,6 +310,28 @@ class Robot:
             "rx_frames": rx,
         }, None
 
+    def set_pick_mode(self, mode: int, dry_run: int = 0):
+        return self.request(CMD_PICK_MODE, struct.pack("<2B", mode, dry_run))[2]
+
+    def pick_status(self):
+        rcmd, payload, err = self.request(CMD_READ_PICK, b"")
+        if err or rcmd != CMD_PICK_STAT or len(payload) != 18:
+            return None, err or "bad pick stat reply"
+        mode, dry, st, val, dx, dy, cw, vx, wy, age, rx = struct.unpack("<4B5h2H", payload)
+        return {
+            "mode": PICK_MODES.get(mode, str(mode)),
+            "dry_run": bool(dry),
+            "state": PICK_STATES.get(st, str(st)),
+            "valid": val,
+            "dx": dx,
+            "dy": dy,
+            "cube_w": cw,
+            "vx": vx,
+            "wy": wy,
+            "age_ms": age,
+            "rx_frames": rx,
+        }, None
+
 
 # --- offline checks --------------------------------------------------------
 
@@ -353,6 +385,10 @@ def run_checks() -> int:
     check("TRACK_CFG length", len(tcfg), 19)
     tread = build_frame(CMD_READ_TRACK)
     check("READ_TRACK length", len(tread), 5)
+    pmode = build_frame(CMD_PICK_MODE, struct.pack("<2B", 2, 0))
+    check("PICK_MODE length", len(pmode), 7)
+    pread = build_frame(CMD_READ_PICK)
+    check("READ_PICK length", len(pread), 5)
 
     print("PASS" if failures == 0 else f"{failures} FAILURE(S)")
     return 1 if failures else 0
@@ -753,6 +789,54 @@ def cmd_track(robot: Robot, args):
     return 1
 
 
+def cmd_pick(robot: Robot, args):
+    act = args.action
+    if act in ("off", "stop"):
+        err = robot.set_pick_mode(0, 0)
+        print("ERROR: " + err if err else "cube pick OFF")
+        return 1 if err else 0
+    if act == "start":
+        err = robot.set_pick_mode(1, 0)
+        print("ERROR: " + err if err else "cube pick ACTIVE (live align & grab)")
+        return 1 if err else 0
+    if act == "dry":
+        err = robot.set_pick_mode(1, 1)
+        print("ERROR: " + err if err else "cube pick ACTIVE (DRY RUN, motors/arm off)")
+        return 1 if err else 0
+    if act == "auto":
+        err = robot.set_pick_mode(2, 0)
+        print("ERROR: " + err if err else "cube pick AUTO (arms on OpenMV arm=1)")
+        return 1 if err else 0
+    if act == "reset":
+        err = robot.set_pick_mode(3, 0)
+        print("ERROR: " + err if err else "cube pick latch reset (AUTO ready)")
+        return 1 if err else 0
+    if act == "status":
+        st, err = robot.pick_status()
+        if err:
+            print(f"ERROR: {err}")
+            return 1
+        print(st)
+        return 0
+    if act == "monitor":
+        print("monitoring OpenMV cube pick (Ctrl-C to stop)")
+        try:
+            while True:
+                st, err = robot.pick_status()
+                if err:
+                    print(f"  ERROR: {err}")
+                else:
+                    print(f"  [{st['mode']:<6}{' DRY' if st['dry_run'] else ''}] "
+                          f"{st['state']:<11} valid={st['valid']} dx={st['dx']:+5d} "
+                          f"dy={st['dy']:+5d} w={st['cube_w']:3d} vx={st['vx']:+4d} "
+                          f"wy={st['wy']:+4d} age={st['age_ms']}ms rx={st['rx_frames']}")
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nstopped")
+        return 0
+    return 1
+
+
 # --- cli -------------------------------------------------------------------
 
 def main(argv=None) -> int:
@@ -838,6 +922,10 @@ def main(argv=None) -> int:
     p.add_argument("--wmax", type=int, default=320, help="max angular rate (default 320)")
     p.add_argument("--swz", type=int, default=320, help="lost-line spin speed (default 320)")
 
+    p = sub.add_parser("pick", help="OpenMV cube search, alignment & auto-grab control")
+    p.add_argument("action",
+                   choices=("start", "stop", "off", "auto", "dry", "reset", "status", "monitor"))
+
     args = ap.parse_args(argv)
 
     if args.check:
@@ -867,6 +955,7 @@ def main(argv=None) -> int:
         "cfg-save": cmd_cfg_save,
         "cfg-reset": cmd_cfg_reset,
         "track": cmd_track,
+        "pick": cmd_pick,
     }
 
     if args.command == "scan":

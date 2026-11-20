@@ -29,6 +29,7 @@
 #include "cfg_store.h"
 #include "zmotord.h"
 #include "line_track.h"
+#include "cube_pick.h"
 #include "bsp_pwm.h"
 #include "usart.h"
 #include "main.h"
@@ -716,15 +717,27 @@ static void push_zm_rx(const char *s)
   }
 }
 
+static void send_omv_body(const char *body)
+{
+  char full[56];
+  uint8_t csum = 0u;
+  for (int i = 0; body[i] != '\0'; i++) { csum ^= (uint8_t)body[i]; }
+  sprintf(full, "@%s*%02X\n", body, csum);
+  push_zm_rx(full);
+}
+
 static void feed_omv_pkt(int err, int ang, int valid, int arm)
 {
   char body[40];
-  char full[52];
-  uint8_t csum = 0u;
-  int n = sprintf(body, "L,%d,%d,%d,%d", err, ang, valid, arm);
-  for (int i = 0; i < n; i++) { csum ^= (uint8_t)body[i]; }
-  sprintf(full, "@%s*%02X\n", body, csum);
-  push_zm_rx(full);
+  sprintf(body, "L,%d,%d,%d,%d", err, ang, valid, arm);
+  send_omv_body(body);
+}
+
+static void feed_omv_pick_pkt(int dx, int dy, int w, int valid, int arm)
+{
+  char body[44];
+  sprintf(body, "O,%d,%d,%d,%d,%d", dx, dy, w, valid, arm);
+  send_omv_body(body);
 }
 
 static void test_line_tracking(void)
@@ -834,6 +847,167 @@ static void test_line_tracking(void)
   TRACK_Init();
 }
 
+static void step_fake_ms(uint32_t ms)
+{
+  uint32_t steps = ms / ROBOT_TICK_MS;
+  for (uint32_t i = 0u; i < steps; i++)
+  {
+    g_fake_tick_ms += ROBOT_TICK_MS;
+    ROBOT_Tick();
+    if ((i % 4u) == 0u)
+    {
+      TRACK_Poll();
+      PICK_Poll();
+    }
+  }
+}
+
+static void test_cube_pick(void)
+{
+  printf("OpenMV @O cube pick, align & 7-step arm\n");
+
+  g_fake_tick_ms = 100u;
+  ROBOT_Init();
+  TRACK_Init();
+  PICK_Init();
+  reset_zm();
+
+  /* Bench arm=0 parses @O without moving chassis or arm */
+  feed_omv_pick_pkt(200, 300, 20, 1, 0);
+  TRACK_Poll();
+  PICK_Poll();
+  pick_status_t st;
+  PICK_GetStatus(&st);
+  check("@O arm=0 stays IDLE without driving",
+        st.rx_frames == 1u && st.dx == 200 && st.dy == 300 &&
+        st.state == PICK_ST_IDLE && g_zm_tx_len == 0u, NULL);
+
+  /* Bad @O checksum rejected */
+  push_zm_rx("@O,99,99,20,1,1*00\n");
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("@O bad checksum ignored", st.rx_frames == 1u, NULL);
+
+  /* SEARCH pulse when valid=0, arm=1 */
+  g_fake_tick_ms = 400u;
+  feed_omv_pick_pkt(0, 0, 0, 0, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  step_fake_ms(260u);
+  feed_omv_pick_pkt(0, 0, 0, 0, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("valid=0 triggers SEARCH spin pulse",
+        st.state == PICK_ST_SEARCH && st.wy_cmd > 0 && g_zm_tx_len >= 60u, NULL);
+
+  /* Finish search pulse + settle, then detect cube far ahead (APPROACH) */
+  step_fake_ms(320u);
+  reset_zm();
+  g_fake_tick_ms += 60u;
+  feed_omv_pick_pkt(-120, 420, 18, 2, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("far cube enters APPROACH driving forward & turning left",
+        st.state == PICK_ST_APPROACH && st.vx_cmd > 0 && st.wy_cmd > 0 &&
+        g_zm_tx_len == 60u, NULL);
+
+  /* Close range enters ALIGN, settles, then strafes left for dx=-140 */
+  feed_omv_pick_pkt(-140, 120, 28, 1, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("close cube brakes and enters ALIGN",
+        st.state == PICK_ST_ALIGN, NULL);
+
+  step_fake_ms(140u);
+  reset_zm();
+  g_fake_tick_ms += 40u;
+  feed_omv_pick_pkt(-140, 120, 28, 1, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("ALIGN strafes left (+vy) when dx=-140",
+        st.state == PICK_ST_ALIGN && st.wy_cmd > 0 && st.vx_cmd == 0 &&
+        g_zm_tx_len == 60u, NULL);
+
+  /* Finish strafe pulse + settle, now nudge forward for dy=120 */
+  step_fake_ms(300u);
+  reset_zm();
+  feed_omv_pick_pkt(10, 120, 30, 1, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("ALIGN nudges forward (+vx) when dy=120",
+        st.state == PICK_ST_ALIGN && st.vx_cmd > 0 && st.wy_cmd == 0 &&
+        g_zm_tx_len == 60u, NULL);
+
+  /* Settle into capture window for 3 confirmation frames -> launch 7-step arm pick */
+  step_fake_ms(300u);
+  reset_zm();
+  for (uint32_t k = 0u; k < PICK_CONFIRM_FRAMES; k++)
+  {
+    g_fake_tick_ms += 20u;
+    feed_omv_pick_pkt(-30, 10, 32, 2, 1);
+    TRACK_Poll();
+    PICK_Poll();
+  }
+  PICK_GetStatus(&st);
+  check("3 settled frames start arm pickup sequence",
+        st.state >= PICK_ST_ARM_WAKE && st.state <= PICK_ST_ARM_PRE, NULL);
+
+  /* Run robot ticks through all 7 arm steps even while OpenMV loses target */
+  for (int step = 0; step < 300; step++)
+  {
+    feed_omv_pick_pkt(0, 0, 0, 0, 1);
+    step_fake_ms(80u);
+    PICK_GetStatus(&st);
+    if (st.state == PICK_ST_HOLDING)
+    {
+      break;
+    }
+  }
+  PICK_GetStatus(&st);
+  check("arm sequence completes to HOLDING with cube clamped at HOME",
+        st.state == PICK_ST_HOLDING &&
+        g_pulse[SERVO_ChannelOf(5u)] >= 1940u &&
+        g_pulse[SERVO_ChannelOf(5u)] <= 1990u &&
+        g_pulse[SERVO_ChannelOf(0u)] == 1000u, NULL);
+
+  /* Holding latches cleanly until RESET mode arrives */
+  reset_zm();
+  g_fake_tick_ms += 500u;
+  feed_omv_pick_pkt(200, 300, 20, 1, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("HOLDING stays latched until RESET",
+        st.state == PICK_ST_HOLDING && g_zm_tx_len == 0u, NULL);
+
+  /* Protocol CMD_READ_PICK (18B) & CMD_PICK_MODE RESET + dry-run */
+  uint8_t f[32];
+  uint8_t ack[24];
+  reset_log();
+  feed(f, frame(f, CMD_READ_PICK, NULL, 0u));
+  check("CMD_READ_PICK replies CMD_PICK_STAT (18B)",
+        find_reply(CMD_PICK_STAT, ack) == 18 && ack[2] == PICK_ST_HOLDING &&
+        ack[3] == 1u && get_s16(&ack[4], 0u) == 200, NULL);
+
+  uint8_t rst_pl[2] = { PICK_MODE_RESET, 0u };
+  reset_log();
+  feed(f, frame(f, CMD_PICK_MODE, rst_pl, 2u));
+  PICK_GetStatus(&st);
+  check("CMD_PICK_MODE RESET restores IDLE/AUTO",
+        find_reply(CMD_ACK, ack) == 2 && ack[1] == ST_OK &&
+        st.state == PICK_ST_IDLE && st.mode == PICK_MODE_AUTO, NULL);
+
+  ROBOT_Init();
+  TRACK_Init();
+  PICK_Init();
+}
+
 int main(void)
 {
   printf("firmware core test\n\n");
@@ -856,6 +1030,7 @@ int main(void)
   test_zmotord_mecanum();
   test_selftest_delta();
   test_line_tracking();
+  test_cube_pick();
 
   printf("\n%s\n", g_fail == 0 ? "PASS" : "FAILURES PRESENT");
   return (g_fail == 0) ? 0 : 1;
