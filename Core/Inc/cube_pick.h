@@ -25,11 +25,12 @@ extern "C" {
 
 #define PICK_RX_TIMEOUT_MS       450u
 #define PICK_SETTLE_MS           170u
-#define PICK_SEARCH_TIMEOUT_MS 12000u
-#define PICK_ACTIVE_TIMEOUT_MS 22000u
-#define PICK_TOL_DX               80
-#define PICK_TOL_DY               75
+#define PICK_SEARCH_TIMEOUT_MS 18000u
+#define PICK_ACTIVE_TIMEOUT_MS 30000u
+#define PICK_TOL_DX               65
+#define PICK_TOL_DY               45
 #define PICK_APPROACH_DY         200
+#define PICK_MIN_GRAB_W           24
 #define PICK_CONFIRM_FRAMES        3u
 
 typedef enum

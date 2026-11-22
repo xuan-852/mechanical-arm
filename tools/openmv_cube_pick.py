@@ -20,7 +20,7 @@ from pyb import UART, LED
 
 # --- user setup ------------------------------------------------------------
 
-AUTO_ARM            = True    # True -> arms STM32 auto pick after countdown
+AUTO_ARM            = False   # Bench safe default: True only when ready for standalone arm=1
 WAIT_BEFORE_ARM_SEC = 3.0     # Blue LED countdown before arm=1
 MAX_RUN_SEC         = 35.0    # Max run window (covers search + align + grab)
 COVER_STOP_BG       = 14      # Pitch-black covered lens stop threshold
@@ -34,17 +34,20 @@ IMG_H               = 240
 FLOOR_ROI           = (0, 124, 320, 116)   # Below door/chair horizon
 
 # Sweet-spot pickup coordinates in QVGA (320x240)
+# Calibrated from real fixed-camera grab frame (dx=0, w=29, top_y=204, bot_y=236..238)
 TARGET_CX           = 160     # Dead-center between green jaws
-TARGET_BOT_Y        = 218     # ~22px above bottom border (deep jaw pocket)
-NOMINAL_CUBE_H      = 32      # Used if cube clips past bottom edge y=239
+TARGET_BOT_Y        = 238     # Exact floor grab reach bottom edge in QVGA
+NOMINAL_CUBE_H      = 34      # Measured cube height (px) at grab reach
 
 # Candidate filter bounds
 MIN_BOX_PX          = 12
-MAX_BOX_PX          = 82
-MAX_CUBE_GRAY       = 115     # Cube interior must stay genuinely dark
-MIN_RING_CONTRAST   = 28      # Surrounding floor must be brighter than cube
+MAX_BOX_PX          = 54
+MAX_CUBE_GRAY       = 125     # Cube interior must stay genuinely dark
+MIN_RING_CONTRAST   = 24      # Surrounding floor must be brighter than cube
 
-TAG_FAMILIES        = image.TAG36H11 | image.TAG25H9 | image.TAG16H5
+TAG_FAMILIES = 0
+for _fam in ("TAG36H11", "TAG25H9", "TAG25H7", "TAG16H5"):
+    TAG_FAMILIES |= getattr(image, _fam, 0)
 
 # --- hardware init ---------------------------------------------------------
 
@@ -109,36 +112,42 @@ def ring_ok(img, b):
     return min(drops) >= MIN_RING_CONTRAST
 
 def find_best_cube(img):
-    st = img.get_statistics(roi=FLOOR_ROI)
-    bg_med = st.l_median()
-    dk = st.l_min()
-    if (bg_med - dk) < MIN_RING_CONTRAST:
-        return None, bg_med
+    # Sample floor brightness in the lower foreground strip so dark furniture/shadows
+    # along the horizon cannot drag down the adaptive blob threshold.
+    st_fg = img.get_statistics(roi=(0, 175, IMG_W, 62))
+    floor_ref = st_fg.l_uq()
+    st_roi = img.get_statistics(roi=FLOOR_ROI)
+    bg_med = st_roi.l_median()
+    dk = st_roi.l_min()
+    if (floor_ref - dk) < MIN_RING_CONTRAST:
+        return None, bg_med, 0
 
-    # Scale threshold from floor median so dark corner shadows cannot wash out the cube
-    thr_hi = max(55, min(MAX_CUBE_GRAY, int(bg_med * 0.55)))
+    thr_hi = max(75, min(MAX_CUBE_GRAY, int(floor_ref * 0.58)))
 
     blobs = img.find_blobs([(0, thr_hi)], roi=FLOOR_ROI,
-                           pixels_threshold=100, area_threshold=120,
-                           merge=True, margin=4)
+                           x_stride=1, y_stride=1,
+                           pixels_threshold=70, area_threshold=90,
+                           merge=False)
     cands = []
     for b in blobs:
+        _, by, _, _ = b.rect()
         bw = b.w()
         bh = b.h()
         if bw < MIN_BOX_PX or bw > MAX_BOX_PX or bh < MIN_BOX_PX or bh > MAX_BOX_PX:
             continue
         ratio = float(bw) / float(max(1, bh))
-        if ratio < 0.55 or ratio > 1.80:
+        max_ratio = 2.60 if (by + bh) >= (IMG_H - 2) else 1.90
+        if ratio < 0.50 or ratio > max_ratio:
             continue
-        if (b.pixels() * 100) < (bw * bh * 30):
+        if (b.pixels() * 100) < (bw * bh * 28):
             continue
         if not ring_ok(img, b):
             continue
-        score = b.pixels() - int(2.0 * abs(b.cx() - TARGET_CX))
+        score = b.pixels() + (by + bh) * 3 - int(2.0 * abs(b.cx() - TARGET_CX))
         cands.append((score, b))
 
     if not cands:
-        return None, bg_med
+        return None, bg_med, thr_hi
 
     cands.sort(key=lambda item: item[0], reverse=True)
     best_b = cands[0][1]
@@ -153,10 +162,12 @@ def find_best_cube(img):
     ty0 = max(0, by - 6)
     tw = min(IMG_W - tx0, bw + 12)
     th = min(IMG_H - ty0, bh + 12)
-    try:
-        tags = img.find_apriltags(roi=(tx0, ty0, tw, th), families=TAG_FAMILIES)
-    except Exception:
-        tags = []
+    tags = []
+    if TAG_FAMILIES:
+        try:
+            tags = img.find_apriltags(roi=(tx0, ty0, tw, th), families=TAG_FAMILIES)
+        except Exception:
+            tags = []
     if tags:
         t = tags[0]
         r = t.rect() if callable(t.rect) else t.rect
@@ -166,7 +177,7 @@ def find_best_cube(img):
         bw = r[2]
         valid = 2
 
-    return (cx, top_y, bot_y, bw, bh, valid, (bx, by, bw, bh)), bg_med
+    return (cx, top_y, bot_y, bw, bh, valid, (bx, by, bw, bh)), bg_med, thr_hi
 
 # --- main loop -------------------------------------------------------------
 
@@ -185,7 +196,7 @@ while True:
     now_ms = time.ticks_ms()
     elapsed_s = time.ticks_diff(now_ms, t_boot) / 1000.0
 
-    hit, bg_med = find_best_cube(img)
+    hit, bg_med, thr_hi = find_best_cube(img)
 
     # Draw floor ROI and calibrated target grab crosshair
     img.draw_rectangle(FLOOR_ROI, color=180)
@@ -247,6 +258,8 @@ while True:
             arm_flag = 1
 
     # --- HUD + LED ---------------------------------------------------------
+    img.draw_rectangle(0, 0, IMG_W, 13, color=0, fill=True)
+    safe_tag = (" t%d" % thr_hi) if AUTO_ARM else (" t%d [SAFE]" % thr_hi)
     if stop_reason is not None:
         img.draw_string(2, 2, "STOP:%s" % stop_reason, color=255)
         set_led(1, 0, int(elapsed_s * 6) % 2)
@@ -254,13 +267,13 @@ while True:
         img.draw_string(2, 2, "WAIT %.1fs" % (WAIT_BEFORE_ARM_SEC - elapsed_s), color=255)
         set_led(0, 0, int(elapsed_s * 5) % 2)
     elif valid == 2:
-        img.draw_string(2, 2, "TAG dx=%d dy=%d" % (dx_out, dy_out), color=255)
+        img.draw_string(2, 2, "TAG dx=%d dy=%d w%d%s" % (dx_out, dy_out, w_out, safe_tag), color=255)
         set_led(0, 1, 1)
     elif valid == 1:
-        img.draw_string(2, 2, "CUBE dx=%d dy=%d" % (dx_out, dy_out), color=255)
+        img.draw_string(2, 2, "CUBE dx=%d dy=%d w%d%s" % (dx_out, dy_out, w_out, safe_tag), color=255)
         set_led(0, 1, 0)
     else:
-        img.draw_string(2, 2, "SEARCH", color=255)
+        img.draw_string(2, 2, "SEARCH%s" % safe_tag, color=255)
         set_led(1, 0, 0)
 
     send_cube_pkt(dx_out, dy_out, w_out, valid, arm_flag)

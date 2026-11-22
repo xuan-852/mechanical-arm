@@ -20,7 +20,9 @@ CUBE_LAB = (0, 34, -25, 25, -25, 25)
 # pad from warmer wood floor; tune L_min/B_max using printed floor_stats if needed)
 PAD_LAB = (52, 100, -35, 18, -50, 8)
 
-TAG_FAMILIES = image.TAG36H11 | image.TAG25H9 | image.TAG16H5
+TAG_FAMILIES = 0
+for _fam in ("TAG36H11", "TAG25H9", "TAG25H7", "TAG16H5"):
+    TAG_FAMILIES |= getattr(image, _fam, 0)
 
 sensor.reset()
 sensor.set_pixformat(sensor.RGB565)
@@ -37,10 +39,12 @@ while True:
     img.draw_line(160, 120, 160, 239, color=(60, 60, 60))
 
     tag_msg = "none"
-    try:
-        tags = img.find_apriltags(roi=FLOOR_ROI, families=TAG_FAMILIES)
-    except Exception:
-        tags = []
+    tags = []
+    if TAG_FAMILIES:
+        try:
+            tags = img.find_apriltags(roi=FLOOR_ROI, families=TAG_FAMILIES)
+        except Exception:
+            tags = []
     if tags:
         def _tag_rect(t):
             return t.rect() if callable(t.rect) else t.rect

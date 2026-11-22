@@ -748,13 +748,23 @@ static void test_line_tracking(void)
   TRACK_Init();
   reset_zm();
 
-  /* Bench preview arm=0 updates telemetry without moving wheels */
-  feed_omv_pkt(-400, -10, 1, 0);
+  /* Safe boot default: OFF ignores even arm=1 until host enables tracking */
+  feed_omv_pkt(-400, -10, 1, 1);
   TRACK_Poll();
   track_status_t st;
   TRACK_GetStatus(&st);
+  check("boot TRACK_MODE_OFF ignores arm=1 without driving",
+        st.mode == TRACK_MODE_OFF && st.state == TRACK_ST_IDLE &&
+        st.rx_frames == 1u && g_zm_tx_len == 0u, NULL);
+
+  check("enable TRACK_MODE_AUTO", TRACK_SetMode(TRACK_MODE_AUTO, 0u) == 0, NULL);
+
+  /* Bench preview arm=0 updates telemetry without moving wheels */
+  feed_omv_pkt(-400, -10, 1, 0);
+  TRACK_Poll();
+  TRACK_GetStatus(&st);
   check("arm=0 parses @L without driving",
-        st.rx_frames == 1u && st.err == -400 && st.ang == -10 &&
+        st.rx_frames == 2u && st.err == -400 && st.ang == -10 &&
         st.state == TRACK_ST_IDLE && g_zm_tx_len == 0u, NULL);
 
   /* Corrupt checksum & motor echo strings must be ignored */
@@ -762,7 +772,7 @@ static void test_line_tracking(void)
   TRACK_Poll();
   TRACK_GetStatus(&st);
   check("bad checksum & motor echo rejected",
-        st.rx_frames == 1u && st.err == -400, NULL);
+        st.rx_frames == 2u && st.err == -400, NULL);
 
   /* Autonomous arm=1 left curve (err<0 -> turn left wz>0 -> vx_R > vx_L) */
   g_fake_tick_ms = 150u;
@@ -872,14 +882,25 @@ static void test_cube_pick(void)
   PICK_Init();
   reset_zm();
 
-  /* Bench arm=0 parses @O without moving chassis or arm */
-  feed_omv_pick_pkt(200, 300, 20, 1, 0);
+  /* Safe boot default: OFF ignores even arm=1 until host enables pick mode */
+  feed_omv_pick_pkt(200, 300, 20, 1, 1);
   TRACK_Poll();
   PICK_Poll();
   pick_status_t st;
   PICK_GetStatus(&st);
+  check("boot PICK_MODE_OFF ignores arm=1 without driving",
+        st.mode == PICK_MODE_OFF && st.state == PICK_ST_IDLE &&
+        st.rx_frames == 1u && g_zm_tx_len == 0u, NULL);
+
+  check("enable PICK_MODE_AUTO", PICK_SetMode(PICK_MODE_AUTO, 0u) == 0, NULL);
+
+  /* Bench arm=0 parses @O without moving chassis or arm */
+  feed_omv_pick_pkt(200, 300, 20, 1, 0);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
   check("@O arm=0 stays IDLE without driving",
-        st.rx_frames == 1u && st.dx == 200 && st.dy == 300 &&
+        st.rx_frames == 2u && st.dx == 200 && st.dy == 300 &&
         st.state == PICK_ST_IDLE && g_zm_tx_len == 0u, NULL);
 
   /* Bad @O checksum rejected */
@@ -887,7 +908,7 @@ static void test_cube_pick(void)
   TRACK_Poll();
   PICK_Poll();
   PICK_GetStatus(&st);
-  check("@O bad checksum ignored", st.rx_frames == 1u, NULL);
+  check("@O bad checksum ignored", st.rx_frames == 2u, NULL);
 
   /* SEARCH pulse when valid=0, arm=1 */
   g_fake_tick_ms = 400u;
@@ -903,7 +924,7 @@ static void test_cube_pick(void)
         st.state == PICK_ST_SEARCH && st.wy_cmd > 0 && g_zm_tx_len >= 60u, NULL);
 
   /* Finish search pulse + settle, then detect cube far ahead (APPROACH) */
-  step_fake_ms(320u);
+  step_fake_ms(450u);
   reset_zm();
   g_fake_tick_ms += 60u;
   feed_omv_pick_pkt(-120, 420, 18, 2, 1);
@@ -934,7 +955,7 @@ static void test_cube_pick(void)
         g_zm_tx_len == 60u, NULL);
 
   /* Finish strafe pulse + settle, now nudge forward for dy=120 */
-  step_fake_ms(300u);
+  step_fake_ms(400u);
   reset_zm();
   feed_omv_pick_pkt(10, 120, 30, 1, 1);
   TRACK_Poll();
@@ -944,8 +965,18 @@ static void test_cube_pick(void)
         st.state == PICK_ST_ALIGN && st.vx_cmd > 0 && st.wy_cmd == 0 &&
         g_zm_tx_len == 60u, NULL);
 
+  /* Far small cube (w=19 < PICK_MIN_GRAB_W) must keep stepping forward even if dy=20 */
+  step_fake_ms(420u);
+  reset_zm();
+  feed_omv_pick_pkt(10, 20, 19, 1, 1);
+  TRACK_Poll();
+  PICK_Poll();
+  PICK_GetStatus(&st);
+  check("too-small w=19 cube keeps stepping forward instead of grabbing short",
+        st.state == PICK_ST_ALIGN && st.vx_cmd > 0 && g_zm_tx_len == 60u, NULL);
+
   /* Settle into capture window for 3 confirmation frames -> launch 7-step arm pick */
-  step_fake_ms(300u);
+  step_fake_ms(420u);
   reset_zm();
   for (uint32_t k = 0u; k < PICK_CONFIRM_FRAMES; k++)
   {

@@ -313,7 +313,7 @@ static void compute_step(uint32_t now_ms, int16_t *vx_out, int16_t *wz_out)
 void TRACK_Init(void)
 {
   s_cfg          = s_default_cfg;
-  s_mode         = (uint8_t)TRACK_MODE_AUTO;
+  s_mode         = (uint8_t)TRACK_MODE_OFF;
   s_dry_run      = 0u;
   s_state        = (uint8_t)TRACK_ST_IDLE;
   s_valid        = 0u;

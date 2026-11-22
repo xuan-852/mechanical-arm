@@ -225,7 +225,7 @@ class Robot:
         if frame is None:
             return None, None, "timeout (no reply -- check wiring/baud/NVIC)"
         rcmd, rpayload = frame
-        if rcmd in (CMD_POSE, CMD_JOINT_CFG, CMD_TRACK_STAT):
+        if rcmd in (CMD_POSE, CMD_JOINT_CFG, CMD_TRACK_STAT, CMD_PICK_STAT):
             return rcmd, rpayload, None
         if rcmd in (CMD_ACK, CMD_NAK) and len(rpayload) == 2:
             orig, status = rpayload
@@ -389,6 +389,28 @@ def run_checks() -> int:
     check("PICK_MODE length", len(pmode), 7)
     pread = build_frame(CMD_READ_PICK)
     check("READ_PICK length", len(pread), 5)
+
+    # Verify Robot.request() accepts telemetry reply frames like CMD_PICK_STAT
+    r = object.__new__(Robot)
+    r.buf = bytearray()
+    class _DummySer:
+        def __init__(self, rx: bytes):
+            self.rx = rx
+        @property
+        def in_waiting(self):
+            return len(self.rx)
+        def read(self, n):
+            chunk, self.rx = self.rx[:n], self.rx[n:]
+            return chunk
+        def reset_input_buffer(self): pass
+        def write(self, _): pass
+        def flush(self): pass
+    r.ser = _DummySer(build_frame(
+        CMD_PICK_STAT, struct.pack("<4B5h2H", 0, 0, 0, 1, -644, 42, 24, 0, 0, 35, 12)))
+    pst, perr = r.pick_status()
+    check("PICK_STAT reply decoded",
+          perr is None and pst["dx"] == -644 and pst["dy"] == 42 and pst["rx_frames"] == 12,
+          True)
 
     print("PASS" if failures == 0 else f"{failures} FAILURE(S)")
     return 1 if failures else 0
@@ -789,6 +811,13 @@ def cmd_track(robot: Robot, args):
     return 1
 
 
+def _format_pick_stat(st: dict) -> str:
+    return (f"  [{st['mode']:<6}{' DRY' if st['dry_run'] else ''}] "
+            f"{st['state']:<11} valid={st['valid']} dx={st['dx']:+5d} "
+            f"dy={st['dy']:+5d} w={st['cube_w']:3d} vx={st['vx']:+4d} "
+            f"wy={st['wy']:+4d} age={st['age_ms']}ms rx={st['rx_frames']}")
+
+
 def cmd_pick(robot: Robot, args):
     act = args.action
     if act in ("off", "stop"):
@@ -818,6 +847,34 @@ def cmd_pick(robot: Robot, args):
             return 1
         print(st)
         return 0
+    if act == "run":
+        print("waking arm to upright HOME...")
+        err = robot.simple(CMD_HOME)
+        if err:
+            print(f"ERROR: {err}")
+            return 1
+        time.sleep(1.4)
+        err = robot.set_pick_mode(1, 0)
+        if err:
+            print(f"ERROR: {err}")
+            return 1
+        print("cube pick RUN active in single session (Ctrl-C to stop wheels/arm & exit)")
+        try:
+            while True:
+                st, err = robot.pick_status()
+                if err:
+                    print(f"  ERROR: {err}")
+                else:
+                    print(_format_pick_stat(st))
+                    if st["state"] in ("HOLDING", "FAIL"):
+                        input(f"\nfinished in {st['state']} -- holding pose; press Enter to exit...")
+                        break
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nstopping...")
+            robot.set_pick_mode(0, 0)
+            robot.simple(CMD_STOP)
+        return 0
     if act == "monitor":
         print("monitoring OpenMV cube pick (Ctrl-C to stop)")
         try:
@@ -826,10 +883,7 @@ def cmd_pick(robot: Robot, args):
                 if err:
                     print(f"  ERROR: {err}")
                 else:
-                    print(f"  [{st['mode']:<6}{' DRY' if st['dry_run'] else ''}] "
-                          f"{st['state']:<11} valid={st['valid']} dx={st['dx']:+5d} "
-                          f"dy={st['dy']:+5d} w={st['cube_w']:3d} vx={st['vx']:+4d} "
-                          f"wy={st['wy']:+4d} age={st['age_ms']}ms rx={st['rx_frames']}")
+                    print(_format_pick_stat(st))
                 time.sleep(0.1)
         except KeyboardInterrupt:
             print("\nstopped")
@@ -924,7 +978,7 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("pick", help="OpenMV cube search, alignment & auto-grab control")
     p.add_argument("action",
-                   choices=("start", "stop", "off", "auto", "dry", "reset", "status", "monitor"))
+                   choices=("run", "start", "stop", "off", "auto", "dry", "reset", "status", "monitor"))
 
     args = ap.parse_args(argv)
 

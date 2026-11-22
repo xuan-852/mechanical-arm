@@ -284,7 +284,7 @@ void PICK_OnFrame(const char *fields, uint32_t now_ms)
 
 void PICK_Init(void)
 {
-  s_mode       = (uint8_t)PICK_MODE_AUTO;
+  s_mode       = (uint8_t)PICK_MODE_OFF;
   s_dry_run    = 0u;
   s_state      = (uint8_t)PICK_ST_IDLE;
   s_valid      = 0u;
@@ -470,8 +470,8 @@ void PICK_Poll(void)
     {
       return;
     }
-    /* Crisp ~15 deg pulsed scan so OpenMV captures clear frames between turns. */
-    fire_pulse(now_ms, 0, 0, 360, 120u);
+    /* Crisp ~10-15 deg pulsed scan with enough torque to break static friction. */
+    fire_pulse(now_ms, 0, 0, 600, 230u);
     return;
   }
 
@@ -492,8 +492,8 @@ void PICK_Poll(void)
     }
     s_last_ctrl_ms = now_ms;
 
-    wz = clamp_s16(-(((int32_t)s_dx * 35) / 100), -240, 240);
-    vx = (iabs32((int32_t)s_dx) > 350) ? 260 : 480;
+    wz = clamp_s16(-(((int32_t)s_dx * 42) / 100), -320, 320);
+    vx = (iabs32((int32_t)s_dx) > 350) ? 520 : 620;
     s_vx_cmd = vx;
     s_wy_cmd = wz;
 
@@ -527,7 +527,8 @@ void PICK_Poll(void)
   }
 
   if ((iabs32((int32_t)s_dx) <= PICK_TOL_DX) &&
-      (iabs32((int32_t)s_dy) <= PICK_TOL_DY))
+      (iabs32((int32_t)s_dy) <= PICK_TOL_DY) &&
+      (s_cube_w >= PICK_MIN_GRAB_W))
   {
     s_settle_ok++;
     if (s_settle_ok >= PICK_CONFIRM_FRAMES)
@@ -541,18 +542,27 @@ void PICK_Poll(void)
 
   if (iabs32((int32_t)s_dx) > 240)
   {
-    int16_t wz = (s_dx < 0) ? 360 : -360;
-    fire_pulse(now_ms, 0, 0, wz, 95u);
+    int16_t wz = (s_dx < 0) ? 620 : -620;
+    fire_pulse(now_ms, 0, 0, wz, 210u);
   }
   else if (iabs32((int32_t)s_dx) > PICK_TOL_DX)
   {
-    int16_t vy = (s_dx < 0) ? 480 : -480;
-    fire_pulse(now_ms, 0, vy, 0, 90u);
+    int16_t  vy       = (s_dx < 0) ? 700 : -700;
+    uint16_t pulse_ms = (iabs32((int32_t)s_dx) > 150) ? 240u : 190u;
+    fire_pulse(now_ms, 0, vy, 0, pulse_ms);
+  }
+  else if (iabs32((int32_t)s_dy) > PICK_TOL_DY)
+  {
+    int32_t  ady      = iabs32((int32_t)s_dy);
+    int16_t  vx       = (ady > 130) ? ((s_dy > 0) ? 660 : -660)
+                                    : ((s_dy > 0) ? 580 : -580);
+    uint16_t pulse_ms = (ady > 130) ? 270u : 200u;
+    fire_pulse(now_ms, vx, 0, 0, pulse_ms);
   }
   else
   {
-    int16_t  vx       = (s_dy > 0) ? 420 : -420;
-    uint16_t pulse_ms = (iabs32((int32_t)s_dy) > 130) ? 105u : 80u;
-    fire_pulse(now_ms, vx, 0, 0, pulse_ms);
+    /* dy looks in-band due to slight camera tilt, but apparent cube width is
+       still too small (< PICK_MIN_GRAB_W) -> step forward closer. */
+    fire_pulse(now_ms, 580, 0, 0, 200u);
   }
 }
