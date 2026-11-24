@@ -39,6 +39,8 @@ tools/
   robot_host.py     Host CLI (`pose`, `home`, `move`, `drive`, `track`, `pick`, `--check`)
   arm_grab_test.py  Single-session interactive 6-axis teach/grab/place console
   grab_poses.json   Hardware-verified floor pickup & placement pose presets
+  openmv_comp.py    OpenMV competition vision script (requires STM32 $E/@V support)
+  field_tests/      Standalone OpenMV field scripts (loop, HOME exit, cross preview)
   openmv_line_track.py  OpenMV Cam H7 Plus dual-rail line-tracking vision script
   openmv_cube_pick.py   OpenMV Cam H7 Plus cube discovery & close-range target script
   openmv_target_cal.py  Read-only OpenMV RGB565 cube/pad pixel calibration helper
@@ -46,7 +48,8 @@ tools/
   fake/             Minimal HAL/CMSIS stubs for offline host C tests
 MDK-ARM/            Keil uVision 5 (`robot.uvprojx`) & EIDE (`eide.yml`) projects
 CALIBRATION.md      Verified pinouts, motor IDs, servo limits & assembly notes
-openmv/             Local test run recordings ledger (`openmv/README.md`, `.mp4` gitignored)
+openmv/             Local test run videos (`.mp4` gitignored)
+OPENMV_RUN_HISTORY.md  Test recording notes and observed regressions
 ```
 
 ---
