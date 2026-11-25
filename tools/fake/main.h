@@ -10,6 +10,20 @@
 #define FLASH_TYPEERASE_PAGES       0u
 #define FLASH_TYPEPROGRAM_HALFWORD  0u
 
+#define GPIO_PIN_8                  ((uint16_t)0x0100u)
+#define GPIO_PIN_RESET              0u
+#define GPIO_PIN_SET                1u
+
+typedef struct
+{
+  uint8_t dummy;
+} GPIO_TypeDef;
+
+extern GPIO_TypeDef g_fake_gpioa;
+#define GPIOA (&g_fake_gpioa)
+
+uint8_t  HAL_GPIO_ReadPin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin);
+
 typedef struct
 {
   uint32_t TypeErase;

@@ -15,9 +15,10 @@ Full measured pin assignments, wheel polarities, and per-joint pulse limits live
 | Subsystem | MCU Pins / Bus | Configuration |
 | :--- | :--- | :--- |
 | Host Link & ISP Flash | `USART1` (`PA9` TX / `PA10` RX) | `115200 8N1`, CRC8 binary protocol & `FlyMcu` (`MDK-ARM/robot/robot.hex`; J-Link disabled on carrier) |
-| Chassis Motors & OpenMV | `USART3` (`PB10` TX / `PB11` RX) | `115200 8N1`; `ZMotorD` IDs `#006` (FR inv), `#007` (FL inv), `#008` (RR fwd), `#009` (RL fwd), millisecond timing; `OpenMV P4 -> RX (PB11)` |
+| Chassis Motors & OpenMV | `USART3` (`PB10` TX / `PB11` RX) | `115200 8N1`; `ZMotorD` IDs `#006` (FR inv), `#007` (FL inv), `#008` (RR fwd), `#009` (RL fwd), millisecond timing; 4-wire `用户接口` (`P4->RX`, `P5<-TX`, `GND`, `5V`) |
+| Launch Key (`按键1`) | `PA8` | Active-LOW w/ pull-up (40 ms debounce): toggles run launch / safe abort-to-home |
 | 6-Axis Arm PWM (`TIM3`) | `PB3, PB8, PB9, PB6, PB7, PB4` | 50 Hz non-overlapping 3 ms slots (`SWJ_NOJTAG`); starts relaxed (`0 us`) at boot, staggered `HOME` wake |
-| Onboard Buzzer | `PB5` | Active-HIGH buzzer; initialized `OUTPUT_PP` LOW in `Core/Src/gpio.c` |
+| Onboard Buzzer | `PB5` | Active-HIGH buzzer; initialized `OUTPUT_PP` LOW (silent) in `Core/Src/gpio.c` |
 | Spare UART (Future Use) | `S3 SA3 (PA2)` / `S4 SA4 (PA3)` | Unallocated STM32 `USART2_TX / USART2_RX` (`3.3V` TTL) |
 
 ---
@@ -32,17 +33,18 @@ Core/
     robot.c         5ms multi-axis synchronous planner, E-stop, speed override
     cfg_store.c     STM32 flash calibration persistence with magic/CRC
     zmotord.c       ZMotorD packet formatter, Mecanum kinematics, USART3 driver
-    line_track.c    OpenMV `@L`/`@O` RX splitter, damped PD line follower & failsafe
-    cube_pick.c     OpenMV `@O` cube search, pulse-jog aligner & 7-step auto pickup
+    exec_srv.c      Frozen competition execution layer (@V/@A/@J/@S/$E, PA8 Key1, watchdog)
+    line_track.c    Legacy OpenMV `@L` PD line follower & failsafe (PC-gated isolation)
+    cube_pick.c     Legacy OpenMV `@O` cube search & 7-step auto pickup (PC-gated isolation)
     protocol.c      USART1 CRC8 frame parser & command dispatcher
 tools/
-  robot_host.py     Host CLI (`pose`, `home`, `move`, `drive`, `track`, `pick`, `--check`)
+  robot_host.py     Host CLI (`pose`, `home`, `move`, `drive`, `track`, `pick`, `exec`, `--check`)
   arm_grab_test.py  Single-session interactive 6-axis teach/grab/place console
   grab_poses.json   Hardware-verified floor pickup & placement pose presets
-  openmv_comp.py    OpenMV competition vision script (requires STM32 $E/@V support)
+  openmv_comp.py    OpenMV H7 Plus competition script ($E/Key1 + 20mm single-line loop over @V)
   field_tests/      Standalone OpenMV field scripts (loop, HOME exit, cross preview)
-  openmv_line_track.py  OpenMV Cam H7 Plus dual-rail line-tracking vision script
-  openmv_cube_pick.py   OpenMV Cam H7 Plus cube discovery & close-range target script
+  openmv_line_track.py  Legacy OpenMV dual-rail line-tracking vision script
+  openmv_cube_pick.py   Legacy OpenMV cube discovery & close-range target script
   openmv_target_cal.py  Read-only OpenMV RGB565 cube/pad pixel calibration helper
   test_core.c       Host-compiled C unit test suite (compiles real Core/Src modules)
   fake/             Minimal HAL/CMSIS stubs for offline host C tests
@@ -74,6 +76,11 @@ OPENMV_RUN_HISTORY.md  Test recording notes and observed regressions
 - Bench-safe boot defaults on this branch: `AUTO_ARM = False` in `openmv_cube_pick.py` and `PICK_MODE_OFF` / `TRACK_MODE_OFF` on STM32 boot (no self-start until terminal `pick run` / `pick start`).
 - Floor-tuned pulse-jog aligner (`ALIGN`: `|dx|<=65, |dy|<=45, w>=24`) uses `580..700` pulses (`190..270 ms`) + `170 ms` brake settle before executing the 7-step pickup (`HOME -> pre -> above -> grab -> clamp -> lift -> home`).
 
+### 4. Frozen Competition Execution Layer (`Core/Src/exec_srv.c`, `tools/openmv_comp.py`)
+- Isolates all hardware actuation on STM32 (`@V` Mecanum drive w/ `280 ms` watchdog, `@A` parameterized 7-step `PICK`/`PLACE` for varying cube sizes, `@J` 6-axis bounded target, `@S` stop/status/speed) while OpenMV handles upper-layer vision & FSM logic.
+- Launch via onboard **`按键1 (PA8)`** (toggles launch / safe-abort-to-home) or PC **`robot_host.py exec run`**; emits `$E,<armed>,<arm_st>,<arm_busy>,<holding>,<robot_st>,<arm_seq>*<XX>` feedback back to OpenMV `P5`.
+- Mutually isolated against legacy `@L`/`@O` modes (boot-disabled; PC scripts retain priority).
+
 ---
 
 ## Quick Start
@@ -83,20 +90,23 @@ OPENMV_RUN_HISTORY.md  Test recording notes and observed regressions
 # Compile and run C firmware core unit tests (MinGW/MSYS gcc)
 gcc -std=c99 -Wall -Wextra -Werror -O1 -DZM_HOST_TEST -Itools/fake -ICore/Inc `
     -o tools/test_core.exe tools/test_core.c Core/Src/servo.c Core/Src/robot.c `
-    Core/Src/protocol.c Core/Src/cfg_store.c Core/Src/zmotord.c Core/Src/line_track.c Core/Src/cube_pick.c -lm
+    Core/Src/protocol.c Core/Src/cfg_store.c Core/Src/zmotord.c Core/Src/exec_srv.c `
+    Core/Src/line_track.c Core/Src/cube_pick.c -lm
 .\tools\test_core.exe
 
 # Host Python protocol & preset bounds checks
 python tools/robot_host.py --check
 python tools/arm_grab_test.py --check
-python -m py_compile tools/openmv_line_track.py tools/openmv_cube_pick.py tools/openmv_target_cal.py
+python -m py_compile tools/openmv_comp.py tools/openmv_line_track.py tools/openmv_cube_pick.py tools/openmv_target_cal.py
 ```
 
 - **Keil Build**: Open `MDK-ARM/robot.uvprojx` (or run `UV4.exe -b MDK-ARM/robot.uvprojx`) to generate `MDK-ARM/robot/robot.hex`, then flash over USB-TTL (`USART1`) using `FlyMcu`.
 
 ### Common Robot Commands
 ```powershell
-# Inspect OpenMV cube coordinates safely without spinning wheels
+# Single-session competition execution monitor/start from PC (Ctrl-C disarms cleanly)
+python tools/robot_host.py --port COM22 exec run
+python tools/robot_host.py --port COM22 exec status
 python tools/robot_host.py --port COM22 pick monitor
 
 # Single-session autonomous search/align/grab (wakes HOME, prevents DTR reset drop, Ctrl-C stops immediately)

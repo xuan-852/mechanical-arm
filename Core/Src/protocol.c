@@ -18,6 +18,7 @@
 #include "usart.h"
 #include "robot.h"
 #include "zmotord.h"
+#include "exec_srv.h"
 #include "line_track.h"
 #include "cube_pick.h"
 
@@ -156,6 +157,7 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
         targets[i] = rd_s16(pl, i);
       }
 
+      EXEC_ForceOff();
       if (ROBOT_MoveToAuto(targets, s_move_ms) != 0)
       {
         send_ack(cmd, ST_ESTOP);
@@ -184,6 +186,7 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
     {
       if (len != 0u) { send_ack(cmd, ST_BAD_LEN); return; }
       if (ROBOT_GetState() == ROBOT_ESTOP) { send_ack(cmd, ST_ESTOP); return; }
+      EXEC_ForceOff();
       ROBOT_GoHome();
       send_ack(cmd, ST_OK);
       break;
@@ -300,6 +303,7 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
     {
       if (len != 8u)                       { send_ack(cmd, ST_BAD_LEN); return; }
       if (ROBOT_GetState() == ROBOT_ESTOP) { send_ack(cmd, ST_ESTOP);   return; }
+      EXEC_ForceOff();
       TRACK_ForceOff();
       PICK_ForceOff();
       ZM_DriveMecanum(rd_s16(pl, 0u), rd_s16(pl, 1u), rd_s16(pl, 2u), rd16(&pl[6]));
@@ -311,6 +315,7 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
     {
       if (len != 10u)                      { send_ack(cmd, ST_BAD_LEN); return; }
       if (ROBOT_GetState() == ROBOT_ESTOP) { send_ack(cmd, ST_ESTOP);   return; }
+      EXEC_ForceOff();
       TRACK_ForceOff();
       PICK_ForceOff();
       ZM_SetWheels(rd_s16(pl, 0u), rd_s16(pl, 1u), rd_s16(pl, 2u), rd_s16(pl, 3u),
@@ -406,6 +411,44 @@ static void handle_frame(uint8_t cmd, const uint8_t *pl, uint8_t len)
       wr16(&p[16], (int16_t)st.rx_frames);
 
       send_frame(CMD_PICK_STAT, p, 18u);
+      break;
+    }
+
+    case CMD_EXEC_MODE:
+    {
+      if (len != 2u) { send_ack(cmd, ST_BAD_LEN); return; }
+      if (EXEC_SetMode(pl[0], pl[1]) != 0)
+      {
+        send_ack(cmd, (ROBOT_GetState() == ROBOT_ESTOP) ? ST_ESTOP : ST_LIMIT);
+        return;
+      }
+      send_ack(cmd, ST_OK);
+      break;
+    }
+
+    case CMD_READ_EXEC:
+    {
+      exec_status_t st;
+      uint8_t p[20];
+
+      if (len != 0u) { send_ack(cmd, ST_BAD_LEN); return; }
+
+      EXEC_GetStatus(&st);
+      p[0] = st.armed;
+      p[1] = st.dry_run;
+      p[2] = st.arm_state;
+      p[3] = st.arm_busy;
+      p[4] = st.holding;
+      p[5] = st.btn1_down;
+      wr16(&p[6],  st.vx_cmd);
+      wr16(&p[8],  st.vy_cmd);
+      wr16(&p[10], st.wz_cmd);
+      wr16(&p[12], (int16_t)st.arm_seq);
+      wr16(&p[14], (int16_t)st.age_ms);
+      wr16(&p[16], (int16_t)st.rx_frames);
+      wr16(&p[18], (int16_t)st.rx_bad);
+
+      send_frame(CMD_EXEC_STAT, p, 20u);
       break;
     }
 

@@ -52,6 +52,8 @@ extern "C" {
 #define CMD_READ_TRACK     0x12u   /* no payload -> CMD_TRACK_STAT             */
 #define CMD_PICK_MODE      0x13u   /* payload: mode(u8), dry_run(u8)           */
 #define CMD_READ_PICK      0x14u   /* no payload -> CMD_PICK_STAT              */
+#define CMD_EXEC_MODE      0x15u   /* payload: mode(u8), dry_run(u8)           */
+#define CMD_READ_EXEC      0x16u   /* no payload -> CMD_EXEC_STAT              */
 
 /* Robot -> host */
 #define CMD_ACK            0x80u   /* payload: cmd, status                */
@@ -60,6 +62,7 @@ extern "C" {
 #define CMD_JOINT_CFG      0x83u   /* payload: joint + cfg (12 bytes)     */
 #define CMD_TRACK_STAT     0x84u   /* payload: track_status_t (16 bytes)  */
 #define CMD_PICK_STAT      0x85u   /* payload: pick_status_t (18 bytes)   */
+#define CMD_EXEC_STAT      0x86u   /* payload: exec_status_t (20 bytes)   */
 
 /* Status codes */
 #define ST_OK              0x00u

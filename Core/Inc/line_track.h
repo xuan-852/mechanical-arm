@@ -71,6 +71,9 @@ typedef struct
 void               TRACK_Init(void);
 void               TRACK_Poll(void);
 
+/* Called by shared UART3 parser after '@L,' and XOR checksum succeed. */
+void               TRACK_OnFrame(const char *fields, uint32_t now_ms);
+
 int                TRACK_SetMode(uint8_t mode, uint8_t dry_run);
 void               TRACK_ForceOff(void);
 int                TRACK_SetConfig(const track_cfg_t *cfg);

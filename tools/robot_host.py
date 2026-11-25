@@ -58,6 +58,8 @@ CMD_TRACK_CFG = 0x11
 CMD_READ_TRACK = 0x12
 CMD_PICK_MODE = 0x13
 CMD_READ_PICK = 0x14
+CMD_EXEC_MODE = 0x15
+CMD_READ_EXEC = 0x16
 
 CMD_ACK = 0x80
 CMD_POSE = 0x81
@@ -65,6 +67,7 @@ CMD_NAK = 0x82
 CMD_JOINT_CFG = 0x83
 CMD_TRACK_STAT = 0x84
 CMD_PICK_STAT = 0x85
+CMD_EXEC_STAT = 0x86
 
 TRACK_MODES = {0: "OFF", 1: "ACTIVE", 2: "AUTO"}
 TRACK_STATES = {0: "IDLE", 1: "FOLLOW", 2: "JUNCTION", 3: "SEARCH", 4: "LOST"}
@@ -74,6 +77,13 @@ PICK_STATES = {
     4: "ARM_WAKE", 5: "ARM_PRE", 6: "ARM_ABOVE", 7: "ARM_GRAB",
     8: "ARM_CLAMP", 9: "ARM_LIFT", 10: "ARM_RETRACT", 11: "ARM_HOME",
     12: "HOLDING", 13: "FAIL",
+}
+EXEC_ARM_STATES = {
+    0: "IDLE", 1: "WAKE",
+    2: "PICK_PRE", 3: "PICK_ABOVE", 4: "PICK_GRAB", 5: "PICK_CLAMP",
+    6: "PICK_LIFT", 7: "PICK_RETRACT", 8: "PICK_HOME",
+    9: "PLACE_PRE", 10: "PLACE_ABOVE", 11: "PLACE_LOWER", 12: "PLACE_REL",
+    13: "PLACE_LIFT", 14: "PLACE_RETRACT", 15: "PLACE_HOME", 16: "CUSTOM",
 }
 
 STATUS = {
@@ -225,7 +235,7 @@ class Robot:
         if frame is None:
             return None, None, "timeout (no reply -- check wiring/baud/NVIC)"
         rcmd, rpayload = frame
-        if rcmd in (CMD_POSE, CMD_JOINT_CFG, CMD_TRACK_STAT, CMD_PICK_STAT):
+        if rcmd in (CMD_POSE, CMD_JOINT_CFG, CMD_TRACK_STAT, CMD_PICK_STAT, CMD_EXEC_STAT):
             return rcmd, rpayload, None
         if rcmd in (CMD_ACK, CMD_NAK) and len(rpayload) == 2:
             orig, status = rpayload
@@ -332,6 +342,31 @@ class Robot:
             "rx_frames": rx,
         }, None
 
+    def set_exec_mode(self, mode: int, dry_run: int = 0):
+        return self.request(CMD_EXEC_MODE, struct.pack("<2B", mode, dry_run))[2]
+
+    def exec_status(self):
+        rcmd, payload, err = self.request(CMD_READ_EXEC, b"")
+        if err or rcmd != CMD_EXEC_STAT or len(payload) != 20:
+            return None, err or "bad exec stat reply"
+        (armed, dry, arm_st, busy, hold, btn1,
+         vx, vy, wz, seq, age, rx, bad) = struct.unpack("<6B3h4H", payload)
+        return {
+            "armed": bool(armed),
+            "dry_run": bool(dry),
+            "arm_state": EXEC_ARM_STATES.get(arm_st, str(arm_st)),
+            "arm_busy": bool(busy),
+            "holding": bool(hold),
+            "btn1_down": bool(btn1),
+            "vx": vx,
+            "vy": vy,
+            "wz": wz,
+            "arm_seq": seq,
+            "age_ms": age,
+            "rx_frames": rx,
+            "rx_bad": bad,
+        }, None
+
 
 # --- offline checks --------------------------------------------------------
 
@@ -410,6 +445,14 @@ def run_checks() -> int:
     pst, perr = r.pick_status()
     check("PICK_STAT reply decoded",
           perr is None and pst["dx"] == -644 and pst["dy"] == 42 and pst["rx_frames"] == 12,
+          True)
+
+    r.ser = _DummySer(build_frame(
+        CMD_EXEC_STAT, struct.pack("<6B3h4H", 1, 0, 4, 1, 0, 1, 560, -40, -120, 7, 25, 42, 0)))
+    est, eerr = r.exec_status()
+    check("EXEC_STAT reply decoded",
+          eerr is None and est["armed"] and est["arm_state"] == "PICK_GRAB"
+          and est["vx"] == 560 and est["wz"] == -120 and est["arm_seq"] == 7,
           True)
 
     print("PASS" if failures == 0 else f"{failures} FAILURE(S)")
@@ -891,6 +934,72 @@ def cmd_pick(robot: Robot, args):
     return 1
 
 
+def _format_exec_stat(st: dict) -> str:
+    tag = "ARMED" if st["armed"] else "DISARM"
+    if st["dry_run"]:
+        tag += " DRY"
+    return (f"  [{tag:<9}] arm={st['arm_state']:<13} busy={int(st['arm_busy'])} "
+            f"hold={int(st['holding'])} btn1={int(st['btn1_down'])} "
+            f"v=({st['vx']:+4d},{st['vy']:+4d},{st['wz']:+4d}) seq={st['arm_seq']} "
+            f"age={st['age_ms']}ms rx={st['rx_frames']} bad={st['rx_bad']}")
+
+
+def cmd_exec(robot: Robot, args):
+    act = args.action
+    if act in ("off", "stop"):
+        err = robot.set_exec_mode(0, 0)
+        print("ERROR: " + err if err else "execution layer DISARMED")
+        return 1 if err else 0
+    if act == "start":
+        err = robot.set_exec_mode(1, 0)
+        print("ERROR: " + err if err else "execution layer ARMED (live OpenMV control)")
+        return 1 if err else 0
+    if act == "dry":
+        err = robot.set_exec_mode(1, 1)
+        print("ERROR: " + err if err else "execution layer ARMED (DRY RUN, actuators off)")
+        return 1 if err else 0
+    if act == "status":
+        st, err = robot.exec_status()
+        if err:
+            print(f"ERROR: {err}")
+            return 1
+        print(st)
+        return 0
+    if act == "run":
+        err = robot.set_exec_mode(1, 0)
+        if err:
+            print(f"ERROR: {err}")
+            return 1
+        print("execution layer ARMED in single session (Ctrl-C to disarm/stop & exit)")
+        try:
+            while True:
+                st, err = robot.exec_status()
+                if err:
+                    print(f"  ERROR: {err}")
+                else:
+                    print(_format_exec_stat(st))
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\ndisarming...")
+            robot.set_exec_mode(0, 0)
+            robot.simple(CMD_STOP)
+        return 0
+    if act == "monitor":
+        print("monitoring frozen execution layer (Ctrl-C to stop)")
+        try:
+            while True:
+                st, err = robot.exec_status()
+                if err:
+                    print(f"  ERROR: {err}")
+                else:
+                    print(_format_exec_stat(st))
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\nstopped")
+        return 0
+    return 1
+
+
 # --- cli -------------------------------------------------------------------
 
 def main(argv=None) -> int:
@@ -980,6 +1089,10 @@ def main(argv=None) -> int:
     p.add_argument("action",
                    choices=("run", "start", "stop", "off", "auto", "dry", "reset", "status", "monitor"))
 
+    p = sub.add_parser("exec", help="Competition execution layer (Key1/$E/@V/@A/@J) control")
+    p.add_argument("action",
+                   choices=("run", "start", "stop", "off", "dry", "status", "monitor"))
+
     args = ap.parse_args(argv)
 
     if args.check:
@@ -1010,6 +1123,7 @@ def main(argv=None) -> int:
         "cfg-reset": cmd_cfg_reset,
         "track": cmd_track,
         "pick": cmd_pick,
+        "exec": cmd_exec,
     }
 
     if args.command == "scan":

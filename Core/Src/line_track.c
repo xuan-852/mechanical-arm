@@ -5,14 +5,13 @@
   ******************************************************************************
   */
 #include "line_track.h"
-#include "cube_pick.h"
+#include "exec_srv.h"
 #include "zmotord.h"
 #include "robot.h"
 #include "main.h"
 
 #include <stddef.h>
 
-#define TRACK_LINE_BUF_LEN   48u
 #define TRACK_SPEED_CEIL    900
 
 static const track_cfg_t s_default_cfg =
@@ -48,66 +47,6 @@ static uint8_t        s_lost_active;
 static uint32_t       s_lost_start_ms;
 static uint8_t        s_was_driving;
 
-static char           s_line[TRACK_LINE_BUF_LEN];
-static uint8_t        s_line_len;
-static uint8_t        s_in_frame;
-
-static int32_t iabs32(int32_t v)
-{
-  return (v < 0) ? -v : v;
-}
-
-static int16_t clamp_s16(int32_t v, int32_t lo, int32_t hi)
-{
-  if (v < lo) { return (int16_t)lo; }
-  if (v > hi) { return (int16_t)hi; }
-  return (int16_t)v;
-}
-
-static int hex_nibble(char c)
-{
-  if ((c >= '0') && (c <= '9')) { return (int)(c - '0'); }
-  if ((c >= 'A') && (c <= 'F')) { return (int)(c - 'A' + 10); }
-  if ((c >= 'a') && (c <= 'f')) { return (int)(c - 'a' + 10); }
-  return -1;
-}
-
-static int parse_i32_field(const char **p, int32_t *out)
-{
-  const char *s = *p;
-  int32_t sign = 1;
-  int32_t val = 0;
-  uint8_t digits = 0u;
-
-  while (*s == ' ') { s++; }
-
-  if (*s == '-')
-  {
-    sign = -1;
-    s++;
-  }
-  else if (*s == '+')
-  {
-    s++;
-  }
-
-  while ((*s >= '0') && (*s <= '9'))
-  {
-    if (val < 100000)
-    {
-      val = (val * 10) + (int32_t)(*s - '0');
-    }
-    digits++;
-    s++;
-  }
-
-  if (digits == 0u) { return -1; }
-
-  *out = val * sign;
-  *p = s;
-  return 0;
-}
-
 static void reset_ctrl_history(void)
 {
   s_has_prev_err = 0u;
@@ -126,105 +65,21 @@ static void stop_motors_if_driving(void)
   }
 }
 
-static void parse_line(uint32_t now_ms)
+void TRACK_OnFrame(const char *fields, uint32_t now_ms)
 {
-  const char *p;
-  int32_t err_v, ang_v, val_v, arm_v;
-  uint8_t star = 0u;
-  uint8_t xor_calc = 0u;
-  int hi, lo;
+  int32_t v[4];
 
-  if ((s_line_len < 11u) || (s_line[1] != ',') ||
-      ((s_line[0] != 'L') && (s_line[0] != 'O')))
+  if (EXEC_ParseCsvI32(fields, v, 4u, 4u, NULL) != 0)
   {
     return;
   }
 
-  for (uint8_t i = 2u; i < s_line_len; i++)
-  {
-    if (s_line[i] == '*')
-    {
-      star = i;
-      break;
-    }
-  }
-
-  if ((star == 0u) || ((uint8_t)(star + 3u) != s_line_len))
-  {
-    return;
-  }
-
-  for (uint8_t i = 0u; i < star; i++)
-  {
-    xor_calc ^= (uint8_t)s_line[i];
-  }
-
-  hi = hex_nibble(s_line[star + 1u]);
-  lo = hex_nibble(s_line[star + 2u]);
-  if ((hi < 0) || (lo < 0) || (((uint8_t)((hi << 4) | lo)) != xor_calc))
-  {
-    return;
-  }
-
-  s_line[star] = '\0';
-  p = &s_line[2];
-
-  if (s_line[0] == 'O')
-  {
-    PICK_OnFrame(p, now_ms);
-    return;
-  }
-
-  if (parse_i32_field(&p, &err_v) != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &ang_v) != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &val_v) != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &arm_v) != 0 || *p != '\0') { return; }
-
-  s_err        = clamp_s16(err_v, -1000, 1000);
-  s_ang        = clamp_s16(ang_v, -90, 90);
-  s_valid      = (uint8_t)clamp_s16(val_v, 0, 2);
-  s_arm        = (arm_v != 0) ? 1u : 0u;
+  s_err        = EXEC_ClampS16(v[0], -1000, 1000);
+  s_ang        = EXEC_ClampS16(v[1], -90, 90);
+  s_valid      = (uint8_t)EXEC_ClampS16(v[2], 0, 2);
+  s_arm        = (v[3] != 0) ? 1u : 0u;
   s_last_rx_ms = now_ms;
   s_rx_frames++;
-}
-
-static void pump_uart3_rx(uint32_t now_ms)
-{
-  uint8_t b;
-
-  while (ZM_ReadByte(&b) == 0)
-  {
-    if (b == (uint8_t)'@')
-    {
-      s_in_frame = 1u;
-      s_line_len = 0u;
-    }
-    else if (s_in_frame != 0u)
-    {
-      if (b == (uint8_t)'\n')
-      {
-        parse_line(now_ms);
-        s_in_frame = 0u;
-        s_line_len = 0u;
-      }
-      else if (b == (uint8_t)'\r')
-      {
-        /* ignore CR */
-      }
-      else if (s_line_len < (uint8_t)(TRACK_LINE_BUF_LEN - 1u))
-      {
-        s_line[s_line_len++] = (char)b;
-      }
-      else
-      {
-        s_in_frame = 0u;
-        s_line_len = 0u;
-      }
-    }
-  }
 }
 
 static void compute_step(uint32_t now_ms, int16_t *vx_out, int16_t *wz_out)
@@ -260,7 +115,7 @@ static void compute_step(uint32_t now_ms, int16_t *vx_out, int16_t *wz_out)
 
   s_lost_active = 0u;
 
-  if ((s_valid == 1u) && (iabs32((int32_t)s_err) >= 60))
+  if ((s_valid == 1u) && (EXEC_Abs32((int32_t)s_err) >= 60))
   {
     s_last_dir = (s_err < 0) ? -1 : 1;
   }
@@ -276,16 +131,16 @@ static void compute_step(uint32_t now_ms, int16_t *vx_out, int16_t *wz_out)
     {
       /* Perpendicular bar / T-junction: hold gentle heading, avoid sudden swing. */
       s_state = (uint8_t)TRACK_ST_JUNCTION;
-      e_comb  = (int32_t)clamp_s16(((int32_t)s_err / 2) +
-                                   (((int32_t)s_ang * (int32_t)s_cfg.k_ang) / 20),
-                                   -400, 400);
+      e_comb  = (int32_t)EXEC_ClampS16(((int32_t)s_err / 2) +
+                                        (((int32_t)s_ang * (int32_t)s_cfg.k_ang) / 20),
+                                        -400, 400);
     }
     else
     {
       s_state = (uint8_t)TRACK_ST_FOLLOW;
-      e_comb  = (int32_t)clamp_s16((int32_t)s_err +
-                                   (((int32_t)s_ang * (int32_t)s_cfg.k_ang) / 10),
-                                   -1200, 1200);
+      e_comb  = (int32_t)EXEC_ClampS16((int32_t)s_err +
+                                        (((int32_t)s_ang * (int32_t)s_cfg.k_ang) / 10),
+                                        -1200, 1200);
     }
 
     if (s_has_prev_err != 0u)
@@ -299,9 +154,9 @@ static void compute_step(uint32_t now_ms, int16_t *vx_out, int16_t *wz_out)
 
     /* Negative err (line on left) -> positive wz (CCW turn left). */
     wz_raw = -(((int32_t)s_cfg.kp * e_comb + (int32_t)s_cfg.kd * d_err) / 100);
-    *wz_out = clamp_s16(wz_raw, -(int32_t)s_cfg.wz_max, (int32_t)s_cfg.wz_max);
+    *wz_out = EXEC_ClampS16(wz_raw, -(int32_t)s_cfg.wz_max, (int32_t)s_cfg.wz_max);
 
-    abs_e   = iabs32(e_comb);
+    abs_e   = EXEC_Abs32(e_comb);
     if (abs_e > 1000) { abs_e = 1000; }
     vx_span = (int32_t)s_cfg.vx_cruise - (int32_t)s_cfg.vx_min;
     if (vx_span < 0) { vx_span = 0; }
@@ -326,8 +181,6 @@ void TRACK_Init(void)
   s_ctrl_primed  = 0u;
   s_last_dir     = 0;
   s_was_driving  = 0u;
-  s_in_frame     = 0u;
-  s_line_len     = 0u;
 
   reset_ctrl_history();
 }
@@ -339,6 +192,11 @@ int TRACK_SetMode(uint8_t mode, uint8_t dry_run)
       (mode != (uint8_t)TRACK_MODE_OFF) && (dry_run == 0u))
   {
     return -1;
+  }
+
+  if (mode != (uint8_t)TRACK_MODE_OFF)
+  {
+    EXEC_ForceOff();
   }
 
   s_mode    = mode;
@@ -377,13 +235,13 @@ int TRACK_SetConfig(const track_cfg_t *cfg)
 
   if (cfg == NULL) { return -1; }
 
-  c.vx_cruise = clamp_s16(cfg->vx_cruise, 0, TRACK_SPEED_CEIL);
-  c.vx_min    = clamp_s16(cfg->vx_min, 0, c.vx_cruise);
-  c.kp        = (uint16_t)clamp_s16((int32_t)cfg->kp, 0, 500);
-  c.kd        = (uint16_t)clamp_s16((int32_t)cfg->kd, 0, 500);
-  c.k_ang     = (uint16_t)clamp_s16((int32_t)cfg->k_ang, 0, 300);
-  c.wz_max    = (uint16_t)clamp_s16((int32_t)cfg->wz_max, 0, TRACK_SPEED_CEIL);
-  c.search_wz = (uint16_t)clamp_s16((int32_t)cfg->search_wz, 0, 600);
+  c.vx_cruise = EXEC_ClampS16(cfg->vx_cruise, 0, TRACK_SPEED_CEIL);
+  c.vx_min    = EXEC_ClampS16(cfg->vx_min, 0, c.vx_cruise);
+  c.kp        = (uint16_t)EXEC_ClampS16((int32_t)cfg->kp, 0, 500);
+  c.kd        = (uint16_t)EXEC_ClampS16((int32_t)cfg->kd, 0, 500);
+  c.k_ang     = (uint16_t)EXEC_ClampS16((int32_t)cfg->k_ang, 0, 300);
+  c.wz_max    = (uint16_t)EXEC_ClampS16((int32_t)cfg->wz_max, 0, TRACK_SPEED_CEIL);
+  c.search_wz = (uint16_t)EXEC_ClampS16((int32_t)cfg->search_wz, 0, 600);
 
   s_cfg = c;
   return 0;
@@ -432,9 +290,9 @@ void TRACK_Poll(void)
   int16_t  vx = 0;
   int16_t  wz = 0;
 
-  pump_uart3_rx(now_ms);
+  EXEC_PumpUartRx(now_ms);
 
-  if (ROBOT_GetState() == ROBOT_ESTOP)
+  if ((ROBOT_GetState() == ROBOT_ESTOP) || (EXEC_IsArmed() != 0u))
   {
     if (s_mode == (uint8_t)TRACK_MODE_ACTIVE)
     {

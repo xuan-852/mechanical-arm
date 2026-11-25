@@ -8,6 +8,7 @@
 #include "servo.h"
 #include "bsp_pwm.h"
 #include "zmotord.h"
+#include "exec_srv.h"
 #include "line_track.h"
 #include "cube_pick.h"
 #include "main.h"
@@ -153,6 +154,7 @@ void ROBOT_Stop(void)
   }
 
   __set_PRIMASK(primask);
+  EXEC_ForceOff();
   TRACK_ForceOff();
   PICK_ForceOff();
   ZM_StopAll();
@@ -163,6 +165,7 @@ void ROBOT_EmergencyStop(void)
   /* Outputs are left untouched on purpose: zeroing PWM makes MG996R drop
      under gravity. Freezing the last frame is the safe behaviour. */
   s_state = ROBOT_ESTOP;
+  EXEC_ForceOff();
   TRACK_ForceOff();
   PICK_ForceOff();
   ZM_StopAll();

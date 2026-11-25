@@ -453,6 +453,11 @@
               <FilePath>../Core/Src/cube_pick.c</FilePath>
             </File>
             <File>
+              <FileName>exec_srv.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/exec_srv.c</FilePath>
+            </File>
+            <File>
               <FileName>stm32f1xx_it.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32f1xx_it.c</FilePath>

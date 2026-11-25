@@ -15,7 +15,8 @@
  *   gcc -std=c99 -Wall -Wextra -Werror -O1 -DZM_HOST_TEST \
  *       -Itools/fake -ICore/Inc -o tools/test_core.exe tools/test_core.c \
  *       Core/Src/servo.c Core/Src/robot.c Core/Src/protocol.c \
- *       Core/Src/cfg_store.c Core/Src/zmotord.c -lm
+ *       Core/Src/cfg_store.c Core/Src/zmotord.c Core/Src/exec_srv.c \
+ *       Core/Src/line_track.c Core/Src/cube_pick.c -lm
  */
 
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #include "protocol.h"
 #include "cfg_store.h"
 #include "zmotord.h"
+#include "exec_srv.h"
 #include "line_track.h"
 #include "cube_pick.h"
 #include "bsp_pwm.h"
@@ -55,6 +57,17 @@ static uint32_t g_fake_tick_ms;
 
 static uint8_t  g_fake_flash[CFG_PAGE_SIZE];
 static uint8_t  g_flash_locked = 1u;
+GPIO_TypeDef    g_fake_gpioa;
+static uint8_t  g_fake_key1_pin = GPIO_PIN_SET;
+
+uint8_t HAL_GPIO_ReadPin(GPIO_TypeDef *GPIOx, uint16_t GPIO_Pin)
+{
+  if ((GPIOx == GPIOA) && (GPIO_Pin == GPIO_PIN_8))
+  {
+    return g_fake_key1_pin;
+  }
+  return GPIO_PIN_SET;
+}
 
 const uint8_t *cfg_fake_flash_ptr(uint32_t offset)
 {
@@ -719,7 +732,7 @@ static void push_zm_rx(const char *s)
 
 static void send_omv_body(const char *body)
 {
-  char full[56];
+  char full[72];
   uint8_t csum = 0u;
   for (int i = 0; body[i] != '\0'; i++) { csum ^= (uint8_t)body[i]; }
   sprintf(full, "@%s*%02X\n", body, csum);
@@ -1037,6 +1050,206 @@ static void test_cube_pick(void)
   ROBOT_Init();
   TRACK_Init();
   PICK_Init();
+  EXEC_Init();
+}
+
+static int find_zm_bytes(const char *needle)
+{
+  size_t nlen = strlen(needle);
+  if ((nlen == 0u) || (g_zm_tx_len < (uint16_t)nlen)) { return 0; }
+  for (uint16_t i = 0u; i <= (uint16_t)(g_zm_tx_len - (uint16_t)nlen); i++)
+  {
+    if (memcmp(&g_zm_tx[i], needle, nlen) == 0) { return 1; }
+  }
+  return 0;
+}
+
+static void step_exec_ms(uint32_t ms)
+{
+  uint32_t steps = ms / ROBOT_TICK_MS;
+  for (uint32_t i = 0u; i < steps; i++)
+  {
+    g_fake_tick_ms += ROBOT_TICK_MS;
+    ROBOT_Tick();
+    if ((i % 4u) == 0u)
+    {
+      EXEC_Poll();
+      TRACK_Poll();
+      PICK_Poll();
+    }
+  }
+}
+
+static void test_exec_layer(void)
+{
+  printf("Frozen STM32 execution layer (PA8 launch, @V/@A/@J/@S, $E, mutex)\n");
+
+  g_fake_key1_pin = GPIO_PIN_SET;
+  g_fake_tick_ms = 100u;
+  BSP_PWM_AllOff();
+  ROBOT_Init();
+  EXEC_Init();
+  TRACK_Init();
+  PICK_Init();
+  reset_zm();
+
+  /* Boot disarmed: @V ignored without driving motors, bad checksum increments rx_bad */
+  exec_status_t st;
+  send_omv_body("V,500,0,0,0");
+  EXEC_Poll();
+  EXEC_GetStatus(&st);
+  check("boot disarmed ignores @V drive",
+        st.armed == 0u && st.rx_frames == 1u &&
+        memchr(g_zm_tx, '#', g_zm_tx_len) == NULL, NULL);
+
+  check("$E telemetry starts with '$' and never contains '#' or '!'",
+        g_zm_tx_len >= 12u && g_zm_tx[0] == '$' && g_zm_tx[1] == 'E' &&
+        memchr(g_zm_tx, '!', g_zm_tx_len) == NULL, NULL);
+
+  push_zm_rx("@V,500,0,0,0*00\n");
+  EXEC_Poll();
+  EXEC_GetStatus(&st);
+  check("bad @V checksum increments rx_bad", st.rx_bad == 1u && st.rx_frames == 1u, NULL);
+
+  /* Enable legacy TRACK/PICK, then press PA8 Key1 -> verifies glitch rejection & mutex */
+  check("enable legacy TRACK_MODE_AUTO first", TRACK_SetMode(TRACK_MODE_AUTO, 0u) == 0, NULL);
+  g_fake_key1_pin = GPIO_PIN_RESET;
+  step_exec_ms(20u); /* < 40ms debounce: must NOT trigger yet */
+  EXEC_GetStatus(&st);
+  check("PA8 20ms glitch does not arm yet", st.armed == 0u, NULL);
+
+  step_exec_ms(40u); /* >= 40ms stable press */
+  g_fake_key1_pin = GPIO_PIN_SET;
+  step_exec_ms(60u);
+  EXEC_GetStatus(&st);
+  track_status_t tst;
+  TRACK_GetStatus(&tst);
+  check("PA8 press arms EXEC, wakes servos, forces legacy TRACK off",
+        st.armed == 1u && tst.mode == TRACK_MODE_OFF &&
+        BSP_PWM_GetPulse(SERVO_ChannelOf(0u)) > 0u, NULL);
+
+  /* Wait for startup home settle */
+  step_exec_ms(300u);
+  EXEC_GetStatus(&st);
+  check("EXEC startup wake finishes upright IDLE",
+        st.arm_busy == 0u && st.holding == 0u, NULL);
+
+  /* Even if @L arm=1 arrives while EXEC is armed, legacy line tracker stays OFF */
+  reset_zm();
+  feed_omv_pkt(-500, 0, 1, 1);
+  EXEC_Poll();
+  TRACK_Poll();
+  TRACK_GetStatus(&tst);
+  check("EXEC armed keeps legacy @L tracker disabled",
+        tst.mode == TRACK_MODE_OFF && tst.state == TRACK_ST_IDLE, NULL);
+
+  /* @V streaming drives mecanum, and 280ms watchdog brakes cleanly when silent */
+  reset_zm();
+  send_omv_body("V,600,-150,80,0");
+  EXEC_Poll();
+  EXEC_GetStatus(&st);
+  check("@V streaming emits motor command",
+        st.vx_cmd == 600 && st.vy_cmd == -150 && st.wz_cmd == 80 &&
+        g_zm_tx_len >= 60u && memcmp(g_zm_tx, "#006P", 5u) == 0, NULL);
+
+  reset_zm();
+  step_exec_ms(320u);
+  EXEC_GetStatus(&st);
+  check("@V 280ms watchdog brakes chassis cleanly",
+        st.vx_cmd == 0 && st.wz_cmd == 0 &&
+        find_zm_bytes("#006P1500T0000!") != 0, NULL);
+
+  /* @A op=1 parameterized PICK with custom cube clamp j5=1250 & j0=420 */
+  uint16_t prev_seq = st.arm_seq;
+  send_omv_body("A,1,420,1700,1250");
+  EXEC_Poll();
+  EXEC_GetStatus(&st);
+  check("@A op=1 starts non-blocking PICK sequence",
+        st.arm_busy == 1u && st.arm_seq == (uint16_t)(prev_seq + 1u), NULL);
+
+  for (int i = 0; i < 400; i++)
+  {
+    step_exec_ms(40u);
+    EXEC_GetStatus(&st);
+    if (st.arm_busy == 0u) { break; }
+  }
+  EXEC_GetStatus(&st);
+  check("@A op=1 finishes at HOME holding custom grip (j5=125.0 deg)",
+        st.arm_busy == 0u && st.holding == 1u &&
+        SERVO_GetActual(5u) == 1250 && SERVO_GetActual(0u) == 450, NULL);
+
+  /* @A op=2 parameterized PLACE carries custom j5 down, releases to j5=920, lifts home */
+  send_omv_body("A,2,460,1690,920");
+  EXEC_Poll();
+  EXEC_GetStatus(&st);
+  check("@A op=2 starts non-blocking PLACE sequence",
+        st.arm_busy == 1u && st.arm_state == EXEC_ARM_PLACE_PRE, NULL);
+
+  /* While descending toward pad, jaws stay closed at held 1250 */
+  step_exec_ms(100u);
+  check("PLACE keeps cube clamped during descent", SERVO_GetActual(5u) == 1250, NULL);
+
+  for (int i = 0; i < 400; i++)
+  {
+    step_exec_ms(40u);
+    EXEC_GetStatus(&st);
+    if (st.arm_busy == 0u) { break; }
+  }
+  EXEC_GetStatus(&st);
+  check("@A op=2 completes release to HOME (holding=0, j5=92.0 deg)",
+        st.arm_busy == 0u && st.holding == 0u && SERVO_GetActual(5u) == 920, NULL);
+
+  /* @J custom 6-axis pose clamps bad bounds & moves */
+  send_omv_body("J,500,1400,800,1100,1800,2000,400");
+  EXEC_Poll();
+  step_exec_ms(1200u);
+  EXEC_GetStatus(&st);
+  check("@J custom pose moves and clamps j5 to hardware max 1485",
+        st.arm_busy == 0u && SERVO_GetActual(1u) == 1400 &&
+        SERVO_GetActual(5u) == 1485, NULL);
+
+  /* Second PA8 press while extended safely stops wheels & retracts arm to HOME */
+  reset_zm();
+  send_omv_body("V,500,0,0,0");
+  EXEC_Poll();
+  g_fake_key1_pin = GPIO_PIN_RESET;
+  step_exec_ms(60u);
+  g_fake_key1_pin = GPIO_PIN_SET;
+  for (int i = 0; i < 300; i++)
+  {
+    step_exec_ms(40u);
+    EXEC_GetStatus(&st);
+    if (st.arm_busy == 0u) { break; }
+  }
+  EXEC_GetStatus(&st);
+  check("Second PA8 press disarms, stops wheels & retracts upright HOME",
+        st.armed == 0u && st.vx_cmd == 0 && SERVO_GetActual(1u) == 918, NULL);
+
+  /* PC USART1 CMD_EXEC_MODE & CMD_READ_EXEC + PC override mutex */
+  uint8_t f[32];
+  uint8_t ack[24];
+  uint8_t em_pl[2] = { EXEC_MODE_ACTIVE, 0u };
+  reset_log();
+  feed(f, frame(f, CMD_EXEC_MODE, em_pl, 2u));
+  EXEC_GetStatus(&st);
+  check("PC CMD_EXEC_MODE arms execution layer",
+        find_reply(CMD_ACK, ack) == 2 && ack[1] == ST_OK && st.armed == 1u, NULL);
+
+  reset_log();
+  feed(f, frame(f, CMD_READ_EXEC, NULL, 0u));
+  check("PC CMD_READ_EXEC replies CMD_EXEC_STAT (20B)",
+        find_reply(CMD_EXEC_STAT, ack) == 20 && ack[0] == 1u && ack[1] == 0u, NULL);
+
+  uint8_t drv_pl[8] = { 0, 0, 0, 0, 0, 0, 100, 0 };
+  reset_log();
+  feed(f, frame(f, CMD_DRIVE_BASE, drv_pl, 8u));
+  EXEC_GetStatus(&st);
+  check("PC CMD_DRIVE_BASE preempts EXEC armed cleanly", st.armed == 0u, NULL);
+
+  ROBOT_Init();
+  EXEC_Init();
+  TRACK_Init();
+  PICK_Init();
 }
 
 int main(void)
@@ -1045,6 +1258,7 @@ int main(void)
   memset(g_fake_flash, 0xFF, sizeof(g_fake_flash));
 
   ROBOT_Init();
+  EXEC_Init();
   PROTO_Init();
   reset_sweep();
 
@@ -1062,6 +1276,7 @@ int main(void)
   test_selftest_delta();
   test_line_tracking();
   test_cube_pick();
+  test_exec_layer();
 
   printf("\n%s\n", g_fail == 0 ? "PASS" : "FAILURES PRESENT");
   return (g_fail == 0) ? 0 : 1;

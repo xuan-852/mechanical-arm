@@ -30,6 +30,7 @@ virtualFolder:
                 - path: ../Core/Src/protocol.c
                 - path: ../Core/Src/cfg_store.c
                 - path: ../Core/Src/zmotord.c
+                - path: ../Core/Src/exec_srv.c
                 - path: ../Core/Src/line_track.c
                 - path: ../Core/Src/cube_pick.c
                 - path: ../Core/Src/stm32f1xx_it.c

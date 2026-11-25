@@ -53,16 +53,16 @@ JOINT_BOUNDS = (
 
 DEFAULT_POSES = {
     "home":  [45.0,  91.8, 90.0,  99.0, 103.5,  90.0],
-    # Safe high clearance above OpenMV with wrist already rotated horizontal (j4=180)
-    "pre":   [45.0, 112.0, 82.0, 112.0, 180.0,  90.0],
-    # ~5cm hover directly above verified floor grab pose
-    "above": [45.0, 152.0, 75.9, 113.0, 180.0,  90.0],
-    # Hardware-verified floor grab pose (open horizontal jaws)
-    "grab":  [45.0, 171.6, 75.9, 113.0, 180.0,  90.0],
-    # Gentle placement pose (~1.6 deg above grab to avoid pressing onto target pad)
-    "place": [45.0, 170.0, 75.9, 113.0, 180.0, 131.9],
-    # Hardware-verified cube clamp pose (1966 us grip)
-    "clamp": [45.0, 171.6, 75.9, 113.0, 180.0, 131.9],
+    # Safe high clearance above OpenMV with wrist already rotated horizontal (j4=165)
+    "pre":   [45.0, 112.0, 82.0, 106.0, 165.0,  90.0],
+    # Hover directly above calibrated floor grab pose
+    "above": [45.0, 160.0, 68.0, 113.0, 165.0,  90.0],
+    # Hardware-verified floor grab pose (open horizontal jaws at j4=165)
+    "grab":  [45.0, 179.9, 79.2, 106.0, 165.0,  90.0],
+    # Gentle placement pose (~1.9 deg above grab to avoid pressing onto target pad)
+    "place": [45.0, 178.0, 79.2, 106.0, 165.0, 115.0],
+    # Hardware-verified cylinder clamp pose (1778 us grip)
+    "clamp": [45.0, 179.9, 79.2, 106.0, 165.0, 115.0],
 }
 
 DEFAULT_POSES_PATH = os.path.join(SCRIPT_DIR, "grab_poses.json")
@@ -292,7 +292,9 @@ def interactive_loop(args: argparse.Namespace) -> int:
                     tgt = list(cur)
                     tgt[5] = clamp_joint(5, cdeg)
                     cur = move_and_wait(robot, cur, tgt, dur_ms=450, speed_pct=args.speed)
-                    print(f"  {format_pose(cur)}")
+                    poses["clamp"][5] = cur[5]
+                    poses["place"][5] = cur[5]
+                    print(f"  {format_pose(cur)}  [session clamp={cur[5]:.1f}; type 'save clamp' to save to disk]")
                 elif cmd in ("dip", "up"):
                     step = float(toks[1]) if len(toks) > 1 else 5.0
                     step = max(-MAX_STEP_DEG, min(MAX_STEP_DEG, step))
@@ -337,12 +339,10 @@ def interactive_loop(args: argparse.Namespace) -> int:
                     save_poses(args.poses, poses)
                     print(f"  saved '{key}' to {args.poses}: {format_pose(poses[key])}")
                 elif cmd == "run":
-                    poses = load_poses(args.poses)
                     auto = len(toks) > 1 and toks[1].lower() == "auto"
                     cur = run_grab_cycle(robot, cur, poses, dur_ms=args.dur,
                                          speed_pct=args.speed, auto=auto)
                 elif cmd == "put":
-                    poses = load_poses(args.poses)
                     auto = len(toks) > 1 and toks[1].lower() == "auto"
                     cur = run_place_cycle(robot, cur, poses, dur_ms=args.dur,
                                           speed_pct=args.speed, auto=auto)

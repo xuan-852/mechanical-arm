@@ -6,6 +6,7 @@
   ******************************************************************************
   */
 #include "cube_pick.h"
+#include "exec_srv.h"
 #include "line_track.h"
 #include "zmotord.h"
 #include "robot.h"
@@ -53,54 +54,6 @@ static uint32_t s_pulse_end_ms;
 static uint32_t s_settle_start_ms;
 static uint32_t s_last_ctrl_ms;
 static uint32_t s_arm_dwell_ms;
-
-static int32_t iabs32(int32_t v)
-{
-  return (v < 0) ? -v : v;
-}
-
-static int16_t clamp_s16(int32_t v, int32_t lo, int32_t hi)
-{
-  if (v < lo) { return (int16_t)lo; }
-  if (v > hi) { return (int16_t)hi; }
-  return (int16_t)v;
-}
-
-static int parse_i32_field(const char **p, int32_t *out)
-{
-  const char *s = *p;
-  int32_t sign = 1;
-  int32_t val = 0;
-  uint8_t digits = 0u;
-
-  while (*s == ' ') { s++; }
-
-  if (*s == '-')
-  {
-    sign = -1;
-    s++;
-  }
-  else if (*s == '+')
-  {
-    s++;
-  }
-
-  while ((*s >= '0') && (*s <= '9'))
-  {
-    if (val < 100000)
-    {
-      val = (val * 10) + (int32_t)(*s - '0');
-    }
-    digits++;
-    s++;
-  }
-
-  if (digits == 0u) { return -1; }
-
-  *out = val * sign;
-  *p = s;
-  return 0;
-}
 
 static void stop_wheels(void)
 {
@@ -163,7 +116,7 @@ static void fire_pulse(uint32_t now_ms, int16_t vx, int16_t vy, int16_t wz,
 static void begin_arm_sequence(uint32_t now_ms)
 {
   stop_wheels();
-  s_j0_aim = clamp_s16(450 - (((int32_t)s_dx * 3) / 10), 320, 580);
+  s_j0_aim = EXEC_ClampS16(450 - (((int32_t)s_dx * 3) / 10), 320, 580);
 
   if (s_dry_run != 0u)
   {
@@ -258,26 +211,18 @@ static void step_arm_sequence(uint32_t now_ms)
 
 void PICK_OnFrame(const char *fields, uint32_t now_ms)
 {
-  const char *p = fields;
-  int32_t dx_v, dy_v, w_v, val_v, arm_v;
+  int32_t v[5];
 
-  if (fields == NULL) { return; }
+  if (EXEC_ParseCsvI32(fields, v, 5u, 5u, NULL) != 0)
+  {
+    return;
+  }
 
-  if (parse_i32_field(&p, &dx_v)  != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &dy_v)  != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &w_v)   != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &val_v) != 0 || *p != ',') { return; }
-  p++;
-  if (parse_i32_field(&p, &arm_v) != 0 || *p != '\0') { return; }
-
-  s_dx       = clamp_s16(dx_v, -1000, 1000);
-  s_dy       = clamp_s16(dy_v, -1000, 1000);
-  s_cube_w   = clamp_s16(w_v, 0, 320);
-  s_valid    = (uint8_t)clamp_s16(val_v, 0, 2);
-  s_arm_flag = (arm_v != 0) ? 1u : 0u;
+  s_dx         = EXEC_ClampS16(v[0], -1000, 1000);
+  s_dy         = EXEC_ClampS16(v[1], -1000, 1000);
+  s_cube_w     = EXEC_ClampS16(v[2], 0, 320);
+  s_valid      = (uint8_t)EXEC_ClampS16(v[3], 0, 2);
+  s_arm_flag   = (v[4] != 0) ? 1u : 0u;
   s_last_rx_ms = now_ms;
   s_rx_frames++;
 }
@@ -309,6 +254,11 @@ int PICK_SetMode(uint8_t mode, uint8_t dry_run)
       (mode != (uint8_t)PICK_MODE_OFF) && (dry_run == 0u))
   {
     return -1;
+  }
+
+  if (mode != (uint8_t)PICK_MODE_OFF)
+  {
+    EXEC_ForceOff();
   }
 
   stop_wheels();
@@ -383,14 +333,17 @@ void PICK_Poll(void)
   uint8_t  fresh;
   uint8_t  armed = 0u;
 
-  if (ROBOT_GetState() == ROBOT_ESTOP)
+  if ((ROBOT_GetState() == ROBOT_ESTOP) || (EXEC_IsArmed() != 0u))
   {
     if (s_mode == (uint8_t)PICK_MODE_ACTIVE)
     {
       s_mode = (uint8_t)PICK_MODE_OFF;
     }
-    stop_wheels();
-    s_state = (uint8_t)PICK_ST_IDLE;
+    s_was_driving = 0u;
+    s_pulsing     = 0u;
+    s_vx_cmd      = 0;
+    s_wy_cmd      = 0;
+    s_state       = (uint8_t)PICK_ST_IDLE;
     reset_cycle_runtime(now_ms);
     return;
   }
@@ -492,8 +445,8 @@ void PICK_Poll(void)
     }
     s_last_ctrl_ms = now_ms;
 
-    wz = clamp_s16(-(((int32_t)s_dx * 42) / 100), -320, 320);
-    vx = (iabs32((int32_t)s_dx) > 350) ? 520 : 620;
+    wz = EXEC_ClampS16(-(((int32_t)s_dx * 42) / 100), -320, 320);
+    vx = (EXEC_Abs32((int32_t)s_dx) > 350) ? 520 : 620;
     s_vx_cmd = vx;
     s_wy_cmd = wz;
 
@@ -526,8 +479,8 @@ void PICK_Poll(void)
     return;
   }
 
-  if ((iabs32((int32_t)s_dx) <= PICK_TOL_DX) &&
-      (iabs32((int32_t)s_dy) <= PICK_TOL_DY) &&
+  if ((EXEC_Abs32((int32_t)s_dx) <= PICK_TOL_DX) &&
+      (EXEC_Abs32((int32_t)s_dy) <= PICK_TOL_DY) &&
       (s_cube_w >= PICK_MIN_GRAB_W))
   {
     s_settle_ok++;
@@ -540,20 +493,20 @@ void PICK_Poll(void)
 
   s_settle_ok = 0u;
 
-  if (iabs32((int32_t)s_dx) > 240)
+  if (EXEC_Abs32((int32_t)s_dx) > 240)
   {
     int16_t wz = (s_dx < 0) ? 620 : -620;
     fire_pulse(now_ms, 0, 0, wz, 210u);
   }
-  else if (iabs32((int32_t)s_dx) > PICK_TOL_DX)
+  else if (EXEC_Abs32((int32_t)s_dx) > PICK_TOL_DX)
   {
     int16_t  vy       = (s_dx < 0) ? 700 : -700;
-    uint16_t pulse_ms = (iabs32((int32_t)s_dx) > 150) ? 240u : 190u;
+    uint16_t pulse_ms = (EXEC_Abs32((int32_t)s_dx) > 150) ? 240u : 190u;
     fire_pulse(now_ms, 0, vy, 0, pulse_ms);
   }
-  else if (iabs32((int32_t)s_dy) > PICK_TOL_DY)
+  else if (EXEC_Abs32((int32_t)s_dy) > PICK_TOL_DY)
   {
-    int32_t  ady      = iabs32((int32_t)s_dy);
+    int32_t  ady      = EXEC_Abs32((int32_t)s_dy);
     int16_t  vx       = (ady > 130) ? ((s_dy > 0) ? 660 : -660)
                                     : ((s_dy > 0) ? 580 : -580);
     uint16_t pulse_ms = (ady > 130) ? 270u : 200u;
