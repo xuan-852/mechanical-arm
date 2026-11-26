@@ -1,162 +1,138 @@
-# 车型搬运竞赛机器人开发交接说明书（队友接手指南）
+# 车型搬运竞赛机器人开发交接与 AI 快速切入说明书
 
-> **分支**：`feat/auto-cube-pick` ｜ **当前主脚本版本**：`RUN_REV = "07-1126D"`（[tools/field_tests/07_comp_map.py](tools/field_tests/07_comp_map.py)）  
-> **硬件底层状态**：STM32 执行层固件已冻结烧录，**不要轻易改动 C 固件**，后续迭代集中在 OpenMV 上位机脚本。  
-> **配套参考**：硬件引脚/舵机标定见 [CALIBRATION.md](CALIBRATION.md)，历史录像索引见 [OPENMV_RUN_HISTORY.md](OPENMV_RUN_HISTORY.md)。
+> **分支**：`feat/auto-cube-pick` ｜ **当前主力比赛脚本**：`RUN_REV = "09-1127A"`（[`tools/field_tests/09_comp_closed_loop.py`](tools/field_tests/09_comp_closed_loop.py)）  
+> **硬件底层状态**：STM32 执行层固件已冻结烧录，**严禁随意改动 C 固件**，所有迭代集中在 OpenMV 单文件脚本。  
+> **配套文档**：硬件引脚/舵机标定见 [CALIBRATION.md](CALIBRATION.md)，历史录像索引见 [OPENMV_RUN_HISTORY.md](OPENMV_RUN_HISTORY.md)。
 
 ---
 
-## 1. 系统架构与通信契约（5 分钟看懂）
+## 0. 给接手 AI 助手的 30 秒速读提示（可直接粘贴给 AI）
 
-整个系统分为**冻结下位机执行层（STM32）**和**可快速迭代上位机决策层（OpenMV Cam H7 Plus）**：
+> 如果队友用 AI（Antigravity / Codex / Claude Code / Cursor 等）继续调试，直接把本文件发给 AI，并附一句：
+> **“先通读 `COMPETITION_DEV_GUIDE.md`，唯一主力代码是 `tools/field_tests/09_comp_closed_loop.py`，不要修改已冻结的 STM32 C 代码，也不要改旧备份 `07`/`08`；任何视觉改动必须先用本地 `openmv/test13..29.mp4` 离线回放验证通过再刷板。”**
+
+### 本车最核心的 4 条系统铁律
+1. **单传感器 + 开环底盘**：全车只有 **OpenMV Cam H7 Plus** 一个传感器，STM32 底盘为**开环 PWM（无编码器、无陀螺仪）**。满电与低电转速可差 **1.5–1.7 倍**，**禁止用长开环毫秒定时决定转角或长距离到位**——定时器只能做超时保护或 ≤13 cm 短距脱障。
+2. **比赛优先级（生死线）**：**放置分第一，回家分翻倍**。没放上 `(b)` 就是 **0 分**；稳放进 `(b)` 50 分环先锁死保底分，回家进 `32×32 cm` HOME 框让总分从 `0.5×` 翻回 `1.0×`；返程一旦异常必须原地刹停，**绝对不能回撞已放好的红柱**。顶部一键开关 `RETURN_TO_HOME = True/False` 可随时切回纯放置保底模式。
+3. **避开静摩擦死区**：实测满电 `wz=640 ≈ 105°/s`，低电 `wz=640 ≈ 69°/s`，但降到 **`wz=440..480` 会掉进静摩擦悬崖（暴跌到 `~35°/s`，低电直接不动）**。所有连续视觉搜索统一用 **`wz=520..540`**，细调使用短脉冲（`70–110 ms` + 停稳读新帧）。
+4. **先检测后画图**：所有 `img.draw_*` 调试叠画必须严格放在全部视觉检测函数执行完之后。
+
+---
+
+## 1. 硬件架构与冻结通信协议
 
 ```mermaid
 flowchart LR
-    OMV["OpenMV Cam H7 Plus<br/>(QVGA RGB565, 视觉+状态机)"] -- "UART3 115200<br/>@V / @J / @S" --> STM32["STM32 执行层 (已冻结)<br/>Core/Src/exec_srv.c"]
-    STM32 -- "UART3 115200<br/>$E 遥测 (约10Hz)" --> OMV
+    OMV["OpenMV Cam H7 Plus<br/>(QVGA 320x240 RGB565<br/>视觉 + 5阶段闭环状态机)"] -- "UART3 115200<br/>@V / @J / @S" --> STM32["STM32 执行层 (已冻结)<br/>Core/Src/exec_srv.c"]
+    STM32 -- "UART3 115200<br/>$E 遥测 (~10Hz)" --> OMV
     KEY1["板载 Key1 (PA8)<br/>按下启动 / 再按急停"] --> STM32
-    STM32 --> CAR["麦轮底盘 ZMotorD<br/>+vx前 / +vy左 / +wz左转"]
-    STM32 --> ARM["6轴机械臂 TIM3 PWM<br/>j0底盘 ~ j5夹爪"]
+    STM32 --> CAR["4轮底盘 ZMotorD (开环PWM)<br/>+vx前 / +vy左 / +wz逆时针左转"]
+    STM32 --> ARM["6轴机械臂 TIM3 PWM<br/>j0云台 ~ j5夹爪 (单位0.1°)"]
 ```
 
-### 关键硬件与协议约束
-- **串口连接**：OpenMV `P4 (TX)` → STM32 `PB11 (RX)`，OpenMV `P5 (RX)` → STM32 `PB10 (TX)`，共地 `GND`，波特率 `115200`。
-- **上行命令（OpenMV → STM32，带 XOR 校验 `*XX\n`）**：
-  - `@V,<vx>,<vy>,<wz>,<ms>*XX`：底盘速度控制。`ms=0` 为流式控制（STM32 内部有 **`280 ms` 看门狗**，超时自动停轮）；`ms>0` 为定时脉冲（常用于近景精细点动对齐）。
-  - `@J,<j0>,<j1>,<j2>,<j3>,<j4>,<j5>,0,<dur_ms>*XX`：6 轴关节绝对角度（单位 **`0.1°`**）。**注意必须是 8 个整数参数**（第 7 位保留填 `0`，第 8 位为运动时长 `dur_ms`），否则下位机不会按 `dur_ms` 插补。
-  - `@S,0,0*XX`：软急停（停底盘和机械臂）；`@S,1,0*XX`：查询心跳。
-- **下行遥测（STM32 → OpenMV）**：
-  - `$E,<armed>,<arm_st>,<arm_busy>,<holding>,<robot_st>,<arm_seq>*XX`
-  - 每次执行 `@J` 必须确认 `arm_seq` 递增且 `arm_busy == 0` 才算到位，**禁止靠纯延时盲切下一步**。
-- **启动/急停机制（`Key1` / `PA8`）**：
-  - OpenMV 要求先看到一次 `armed == 0`（`READY KEY1`），按下 `Key1` 变成 `armed == 1` 后才会启动状态机；运行中再按 `Key1` 或用手遮住镜头（`l_mean <= 10` 连续 8 帧）立即急停锁死。
-- **PC 调试工具**（注意：通过 CH340 打开串口会触发 DTR/RTS 复位 STM32）：
-  - 查底盘/状态：`python tools/robot_host.py --port COM22 drive 560 0 0 --time 500`
-  - 单测机械臂抓放：`python tools/arm_grab_test.py --check`（标定姿态保存在 `tools/grab_poses.json`）
+### 关键物理与协议参数
+- **整车与场地关键尺寸**：
+  - 整车占地：**`21 cm`（宽）× `27 cm`（长）**；
+  - `HOME` 方框：**`32 × 32 cm`** → 左右余量 `±5.5 cm`，**前后总余量仅 `5.0 cm`（`±2.5 cm`）**，因此进框深度必须靠视觉锚点，不能盲跑 `17 cm`！
+  - 场地俯视方位（记忆基准）：**北 = 白墙自行车**，**东 = 大“2”号墙**，**南 = 橙色电梯门（`HOME` 在底边外轨南侧，“二维码”在 `HOME` 西侧）**，**西 = 大灰柱**。
+- **串口与协议**（`P4 TX → PB11 RX`，`P5 RX → PB10 TX`，共地，`115200`，异或校验 `*XX\n`）：
+  - `@V,<vx>,<vy>,<wz>,<ms>*XX`：`ms=0` 为流式控制（STM32 内部有 **`280 ms` 速度看门狗**，超时自动停轮）；`ms>0` 为定时脉冲。
+  - `@J,<j0>,<j1>,<j2>,<j3>,<j4>,<j5>,0,<dur_ms>*XX`：**必须是 8 个整数参数**（第 7 位固定 `0`，第 8 位运动时长 `dur_ms`）。
+  - `@S,0,0*XX` 软急停；`@S,1,0*XX` 心跳查询。
+  - `$E,<armed>,<arm_st>,<arm_busy>,<holding>,<robot_st>,<arm_seq>*XX`：每步 `@J` 必须等 `arm_seq` 变化且 `arm_busy == 0` 才切下一步。
+- **机械臂已标定姿态（单位 `0.1°`，与 `tools/grab_poses.json` 一致）**：
+  - `ARM_HOME = (450, 918, 900, 990, 1035)`
+  - `ARM_PRE = (450, 1120, 820, 1060, 1650)`
+  - `ARM_ABOVE = (450, 1600, 680, 1130, 1650)`
+  - `ARM_CONTACT = (450, 1799, 792, 1060, 1650)`
+  - `JAW_OPEN = 900`，`JAW_CLAMPED = 1150`
+- **抓取与对位基准**：`TARGET_CX = 130`，`TOL_X = 8`（已从 10 收紧防满电偏边缘顶盖），`TARGET_BOT_Y = 239`，`B_PUT_EXTRA_CM = 2.5`。
 
 ---
 
-## 2. 仓库核心文件导览
+## 2. 仓库核心文件索引
 
-| 文件 | 作用 | 当前状态 |
+| 文件 | 作用 | 状态 |
 | :--- | :--- | :--- |
-| `Core/Src/exec_srv.c` / `Core/Inc/exec_srv.h` | STM32 执行服务、看门狗、`Key1` 门控、`$E` 遥测 | **已冻结，已烧录，勿随意改** |
-| `tools/grab_poses.json` & `tools/arm_grab_test.py` | 6 轴抓取/放置姿态标定与主机校验工具 | **已标定验证通过** |
-| `tools/field_tests/04_pick_cyl.py` | 单体圆柱视觉对位 + 7 步抓放测试脚本 | **已实车 5/5 验证通过** |
-| `tools/field_tests/05_mat_probe.py` | 场地无动作视觉探针（测各色圆柱/十字/黑线 LAB） | 辅助标定工具 |
-| `tools/field_tests/06_track_and_pick.py` | 出 `HOME` → 外轨巡线 → 抓第 1 块圆柱半程脚本 | **已实车验证通过** |
-| **`tools/field_tests/07_comp_map.py`** | **竞赛主状态机（`07-1126D`）：出 HOME → 抓 → 放 `(b)` → 回 HOME** | **当前主力开发文件** |
-| `openmv/test1..21.mp4`, `VID_20261126_*.mp4` | OpenMV 录屏与手机俯拍（已 `.gitignore`，仅本地留档） | 复盘依据 |
+| **`tools/field_tests/09_comp_closed_loop.py`** | **最新主力比赛脚本（`09-1127A`）：完整 5 阶段纯视觉闭环** | **直接刷入 OpenMV `main.py` 使用** |
+| `tools/field_tests/08_outer_return_home.py` | 独立外圈返程与左侧 HOME 入库验证脚本（`08-1126C`） | 历史对比/单测备份 |
+| `tools/field_tests/07_comp_map.py` | 上一代全流程主脚本（`07-1126E`） | 历史对比备份 |
+| `tools/field_tests/04_pick_cyl.py` / `05_mat_probe.py` | 单体抓柱测试 / 场地 LAB 阈值探针 | 标定辅助工具 |
+| `Core/Src/exec_srv.c` / `Core/Inc/exec_srv.h` | STM32 执行服务、看门狗、`Key1` 门控、`$E` 遥测 | **已冻结烧录，勿改** |
+| `tools/robot_host.py` / `tools/arm_grab_test.py` | PC 串口联调底盘与机械臂抓放（注意 CH340 打开会复位板子） | 桌面标定工具 |
+| `openmv/test1..29.mp4` | 真实赛场 OpenMV 320×240 录屏（已 `.gitignore`，仅本地保存） | **离线回归测试核心数据集** |
 
 ---
 
-## 3. 当前实测进度总览（截至 `test21` & `07-1126D`）
-
-### 已稳定跑通的环节
-1. **自主出 `HOME` + 跑道 `+` 十字定外轨**：`HOME_PRE_TURN (1000ms @ wz=540)` → `LEAVE_HOME (1000ms @ vx=580, wz=60)` → `HOME_FIND_CROSS` 紫框锁定跑道 `+` 十字 → 偏左锚点（`OUTER_LOCK_INIT_CX = 40.0`）切入外轨，**`test14`–`test21` 连续稳定不进内圈**。
-2. **外轨寻柱 + 视觉对位 + 7 步机械臂抓取**：已解决黑线误报黑柱 `K`（`black_blob_follows_tape`），**`test14`–`test21` 连续 7 趟稳定抓起红圆柱**。
-3. **靶环 `(b)` 同心弧对位 + 50 分靶心立放**：`ALIGN_B_RING`（基于局部对比度多行同心弦拟合）+ `B_PUT_EXTRA_CM = 2.5 cm` 前挪 + 7 步 `PLACE_STEPS`，**`test15`、`test16`、`test18`、`test19` 多次实测稳立在 `(b)` 中心 50 分靶环内**。
-4. **放完柱后退出并捕回外轨**：`PAD_REVERSE (16 cm)` → `RETURN_OUT_TURN (160° CW)` → `RETURN_OUT_CROSS`（`detect_return_rail` 双侧白垫校验，拒绝垫外边界）→ `RETURN_JOIN_OUTER`。
-
-### 本次刚改完、待满电实测的最后两处（`07-1126D`）
-1. **夹完后的 `TURN_TO_INNER` 已由开环 `85°` 改为闭环认 `(b)` `+` 十字**：
-   - 原因：`test20`/`test21` 凌晨电池掉压导致开环 `85°` 少转 `15°–20°`，把 `(b)` 甩到画面最右边缘出界。
-   - `07-1126D` 改为右转过 `55°` 后盯住 `(b)` 门口 `+` 十字（`x ∈ [135, 255], bot >= 148`，上限 `175°`），不再受电量影响；同时 `CROSS_STEP_MS` 提到 `520 ms`，`scan_b_ring` 初搜中心改为画面正中 `160`（覆盖 `[22, 298]`）。
-2. **回 `HOME` 门框识别防误触 + 门口微调**：
-   - `detect_home_branch` 第 485 行由 `max(...) >= 145` 改为 **`min(...) >= 145`**（要求 `HOME` 侧边黑线上下两侧都是亮白垫，解决 `test18` 把垫外暗地砖当成 `HOME` 分支提前右转的问题）。
-   - `RETURN_VERIFY_HOME_GATE` 增加 `home_box` 偏心时的自动微调转向（`1400 ms` 预算）；停入深度 **`HOME_PARK_STOP_Y = None`** 尚未用实车停稳帧标定，首次真进框会安全停报 `HOME CHECK`。
-
----
-
-## 4. 已实测标定的硬参数速查表（`07_comp_map.py`）
-
-### 4.1 底盘运动学标定（实测场地铺垫）
-| 实测命令 | 实测结果 | 拟合公式 |
-| :--- | :--- | :--- |
-| `drive 560 0 0 --time 500` | 前进 `6.2 cm` | 稳态速度 **`16.0 cm/s`**，起步死区 **`112 ms`** |
-| `drive 560 0 0 --time 1000` | 前进 `14.2 cm` | `cm_to_ms(cm) = round(112 + cm * 1000 / 16.0)` |
-| `drive 0 0 640 --time 1300` | 原地左转 `90°` | `deg_to_ms(deg) = round(deg / 90.0 * 1300)` |
-
-### 4.2 机械臂 6 轴抓取/放置姿态（单位 `0.1°`，与 `tools/grab_poses.json` 一致）
-- `ARM_HOME = (450, 918, 900, 990, 1035)`（收纳行进姿态）
-- `ARM_PRE = (450, 1120, 820, 1060, 1650)`（`j4=165.0°` 水平手腕预备）
-- `ARM_ABOVE = (450, 1600, 680, 1130, 1650)`（目标正上方悬停）
-- `ARM_CONTACT = (450, 1799, 792, 1060, 1650)`（抓柱与放柱共用同一触地姿态）
-- 夹爪：`JAW_OPEN = 900`（张开），`JAW_CLAMPED = 1150`（夹紧圆柱）
-
-### 4.3 视觉对位与颜色阈值（QVGA `320×240` RGB565）
-- **抓取 & 靶心绿十字基准**：`TARGET_CX = 130`、`TOL_X = 10`、`TARGET_BOT_Y = 239`、`TOL_Y_NEAR = 236..240`、`MAX_CLIP_TOP_Y = 192`。
-- **5 色圆柱阈值**：
-  - 红 `THR_RED = (10, 95, 18, 127, 0, 127)`
-  - 蓝 `THR_BLUE = (10, 90, -35, 35, -128, -18)`
-  - 绿 `THR_GREEN = (10, 85, -128, -14, 5, 127)`
-  - 黑 `THR_BLACK = (0, 15, -14, 14, -14, 14)`（`merge=False` + `black_blob_follows_tape` 沿顶边追踪窄轨排雷）
-  - 白 `ENABLE_WHITE = False`（已写 3D 侧影检测 `detect_white_cyl`，**默认关闭**，开启前需在场地无白块空垫上确认零误报）
-- **`+` 十字检测（`detect_cross`）**：`THR_CROSS = (0, 44, -18, 18, -18, 18)`，`8 <= h <= 115`，`w <= 7.5 * h`，`0.18 <= sol <= 0.62`，5 个臂点 `<= 110` 且至少 3 个角亮于臂点 `>= 22`（兼容远距扁平透视十字）。
-
----
-
-## 5. 主状态机流程与分段调试开关
+## 3. 主力脚本 `09_comp_closed_loop.py`（`09-1127A`）5 阶段闭环设计
 
 ```mermaid
 flowchart TD
-    W["WAIT_KEY1 -> WAIT_ARM_WAKE"] --> H1["HOME_PRE_TURN (1000ms@540)<br/>-> LEAVE_HOME (1000ms@580,60)"]
-    H1 --> H2["HOME_FIND_CROSS<br/>左转锁跑道 '+' (x=75..255)"]
-    H2 --> O1["FOLLOW_OUTER_PICK<br/>偏左锚点巡外轨找柱"]
-    O1 --> O2["BRAKE_PICK -> ALIGN_PICK<br/>-> ARM_SEND (7步 PICK)"]
-    O2 --> I1["TURN_TO_INNER<br/>闭环右转锁 (b) '+' (x=135..255)"]
-    I1 --> I2["CROSS_TO_INNER<br/>520ms步进 + 宽搜 (b) 靶环"]
-    I2 --> B1["ALIGN_B_RING<br/>同心弧拟合对准 (130,239)"]
-    B1 --> B2["B_PUT_NUDGE (+2.5cm)<br/>-> ARM_SEND (7步 PLACE)"]
-    B2 --> R1["PAD_REVERSE (-16cm)<br/>-> RETURN_OUT_TURN (160° CW)"]
-    R1 --> R2["RETURN_OUT_CROSS<br/>detect_return_rail 捕外轨"]
-    R2 --> R3["RETURN_JOIN_OUTER<br/>左转并外轨东向 (HOME在右)"]
-    R3 --> R4["RETURN_FOLLOW_OUTER<br/>detect_home_branch 认右侧T分支"]
-    R4 --> R5["RETURN_CENTER_HOME_GATE (42cm)<br/>-> RETURN_TURN_INTO_HOME (90° CW)"]
-    R5 --> R6["RETURN_VERIFY_HOME_GATE<br/>-> RETURN_PARK_IN_HOME -> DONE HOME"]
+    S0["WAIT_KEY1 -> WAIT_ARM_WAKE"] --> S1A["阶段1: HOME_PRE_TURN (<=520ms,+540)<br/>-> LEAVE_HOME (<=850ms,vx560)<br/>见E3/E4立刻切出, 不盲走"]
+    S1A --> S1B["HOME_FIND_CROSS<br/>锁E4: 最左外轨竖立(|ang|<=65)<br/>+ 跑道'+'在外轨右侧(cx>rail+30)<br/>过转自动右拉自救"]
+    S1B --> S2["阶段2: FOLLOW_OUTER_PICK<br/>tapes[0]+OUTER_RECOVER锁外轨<br/>-> ALIGN_PICK(TOL_X=8, 70ms)<br/>-> 7步 PICK"]
+    S2 --> S3A["阶段3: TURN_TO_INNER (-540)<br/>双保险: 阴影自适应(b)'+'(155..295)<br/>OR 直接锁(b)靶环(95..225)"]
+    S3A --> S3B["CROSS_TO_INNER -> ALIGN_B_RING<br/>-> B_PUT_NUDGE(+2.5cm) -> 7步 PUT"]
+    S3B --> S4A["阶段4: PAD_REVERSE (-13cm)<br/>若 RETURN_TO_HOME=False -> STOP:PLACED"]
+    S4A --> S4B["TURN_TO_TOP_RAIL (+540,450ms 朝西北)<br/>-> CROSS_TO_OUTER 跳过内轨停北外轨"]
+    S4B --> S4C["JOIN_OUTER_CW (-540, ang<=65)<br/>-> FOLLOW_OUTER_LOOP (8.5s 顺时针归正)"]
+    S4C --> S5A["阶段5: FOLLOW_OUTER_TO_HOME (关左跳)<br/>认HOME左墙 W=1 -> 门口空隙 -> W=2 (+10cm)"]
+    S5A --> S5B["HOME_TURN_INTO_BOX -> HOME_VERIFY_ALIGN<br/>抗地砖反光后边线检测 (|tilt|<=12)"]
+    S5B --> S5C["HOME_PARK_IN_BOX<br/>后边线滚到 y>=224 零点锚定 + 5.5cm<br/>-> STOP:DONE HOME (绿灯)"]
 ```
 
-### 6 种分段测试开关（修改 `07_comp_map.py` 第 33 行 `TEST_STAGE`）
-| `TEST_STAGE` 值 | 摆放位置 | 作用 |
+### 已在真实赛场录像（`openmv/test13..29.mp4`）上通过的离线回归指标
+直接调用 `09_comp_closed_loop.py` 自身视觉函数对真实 320×240 视频逐帧回放（`py_compile` + AST 符号审计 `missing=0`）：
+- **阶段 1（出 HOME）**：`test13 / 15 / 16 / 18 / 19`（成功）+ `test25`（满电过冲）+ `test26`（Run 1 & Run 3 摆在 `+` 后方）= **8/8 命中 `E4`**；`test27`（3 次内岛 `+` 误锁劫持）= **0/3 误触发（100% 屏蔽）**。
+- **阶段 2（抓柱）**：`TOL_X = 8`、`FINE_YAW_PULSE_MS = 70` 单测通过，解决满电一脚脉冲甩偏导致黄夹爪顶在红柱上沿的问题。
+- **阶段 3（进 `(b)`）**：`test15 / 16 / 18 / 19` = **4/4 命中**（`detect_b_ring` 直接锁环分别命中 `4/8/8/7` 帧，`detect_b_cross` 命中 `test18/19`）。
+- **阶段 4（北直道并外圈）**：`test29` 实测 `detect_outer_rail_ahead` 命中 `2` 帧，`JOIN_OUTER_CW`（`ang <= 65°`）命中 `2` 帧。
+- **阶段 5（抗反光进 HOME）**：`test28 00:23–26` 走廊地砖顶灯强反光帧 **10/11 帧稳锁**（准确输出 `tilt ≈ -45`）；`test22 00:15–16` 内圈弯道干扰 **0 误触发**。
+
+---
+
+## 4. 队友实测与现场调参 SOP
+
+### 4.1 刷写与顶部一键开关
+用 OpenMV IDE 打开 [`tools/field_tests/09_comp_closed_loop.py`](tools/field_tests/09_comp_closed_loop.py) → `工具 → 将打开的脚本保存到 OpenMV Cam（作为 main.py）`，确认 HUD 右上角显示 **`09-1127A`**。
+
+| 开关（文件第 36–37 行） | 可选值 | 用途 |
 | :--- | :--- | :--- |
-| **`"FULL_1_BLOCK"`**（当前默认） | 车停在 `HOME` 框内面朝北 | 完整 1 块搬运 + 放 `(b)` + 自主回 `HOME` |
-| `"OUTER_PICK_ONLY"` | 车停在 `HOME` 框内 | 出框 → 巡外轨 → 夹起第 1 块后即停（报 `PICKED`） |
-| `"B_PICK_PLACE"` | 车停在 `HOME` 框内 | 抓第 1 块并放到 `(b)` 后原地停（报 `B PUT DONE`） |
-| `"B_APPROACH_TEST"` | 车摆在外轨抓柱停位、面朝西 | 不动臂，单测 `TURN_TO_INNER → CROSS_TO_INNER → ALIGN_B_RING` |
-| `"B_RING_TEST"` | 车手动摆在内圈、面朝 `(b)` | 单测靶环视觉对位（待机可预览 `B=x,y`，到位报 `B AIM READY`） |
-| `"HOME_RETURN_TEST"` | 车摆在底边外轨东向（`HOME` 在右） | 单测认 `HOME` 右侧 T 分支 → 走 `42 cm` → 右转入框停车 |
+| **`RETURN_TO_HOME`** | `True`（默认）/ `False` | 设为 `False` 时放完 `(b)` 后退 `13 cm` 直接亮绿灯停 `PLACED`（极端保底不冒返程风险） |
+| **`TEST_STAGE`** | `"FULL_1_BLOCK"`（默认） | 正式比赛整趟 |
+| | `"EXIT_TEST"` | 单测阶段 1（出 HOME 锁外轨后即停 `EXIT OK`） |
+| | `"B_PICK_PLACE"` | 单测阶段 1→2→3（抓放 `(b)` 后退 13 cm 停 `PLACED`） |
+| | `"B_APPROACH_TEST"` / `"B_RING_TEST"` | 摆在抓柱位 / 面对 `(b)` 单测靶环对位（不动臂） |
+| | `"FROM_B_OUTER_LOOP"` | 摆在 `(b)` 放完姿态单测阶段 4+5（上北直道回 HOME） |
+| | `"HOME_LEFT_TEST"` | 摆在底边外轨 `HOME` 东侧朝西，单测阶段 5 两堵墙 + 入框 |
 
-### 脱机日志与排障速查
-- **刷写脱机运行**：OpenMV IDE 打开 `tools/field_tests/07_comp_map.py` → `工具 → 将打开的脚本保存到 OpenMV Cam（作为 main.py）`（或直接覆盖 `F:\main.py`），**确认 HUD 右上角显示 `07-1126D`**。
-- **脱机运行记录**：每次停机/掉链会自动写入 OpenMV U 盘 **`F:\map_last_run.txt`**，格式示例：
-  `rev=07-1126D mode=FULL_1_BLOCK stage=CROSS_TO_INNER stop=NO B RING elapsed_ms=... cross_steps=... cross_hits=... ring=...`
-- **LED 含义**：蓝灯闪 = 等待 `Key1`；青色常亮 = 机械臂动作中；绿灯常亮 = 正常运行或成功停机；红蓝交替快闪 = 故障锁停（看 HUD 顶部 `STOP:xxx`）。
+### 4.2 没有场地时在宿舍就能完成的 2 项标定（强烈建议赛前做！）
+1. **红柱桌面抓放复核（排除 `test27` 顶盖隐患）**：普通桌面放一根红柱，运行抓放测试或看机械臂归中，确认最底下的云台舵机 `j0=450` 每次归正无松旷回差，确认爪子能稳稳垂直提起红柱。
+2. **黑胶带贴 `32×32 cm` 假框标定 HOME 停车深度**：地板上贴一个 `32×32 cm` 方框，把 `21×27 cm` 车手摆在框正中（前后各留 `2.5 cm`），看 OpenMV 预览画面：
+   - 如果后边线仍在画面底部（比如 `y = 228`），直接把 `09_comp_closed_loop.py` 里的 **`HOME_PARK_STOP_Y = 228`** 填上即可实现纯视觉刹停；
+   - 如果后边线刚好滚出画面底边几厘米，就实测从后边线到 `y = 224` 离最终正中差几厘米，微调 **`HOME_POST_ANCHOR_CM`**（当前默认 `5.5 cm`）。
 
----
-
-## 6. 队友接手后的实测与开发 SOP
-
-### 第一阶段：充完电，先把 1-Block 全程彻底跑通（预计 2–3 趟）
-1. **换上满电电池**，将最新 `07_comp_map.py`（`07-1126D`，默认 `FULL_1_BLOCK`）覆盖到 OpenMV，在外轨放 1 个彩色圆柱，直接按 `Key1` 跑全程并同时录 OpenMV 画面 + 手机俯拍。
-2. **按停机码 `STOP:xxx` 定点微调（每次只改一个参数）**：
-   - `STOP:NO B CROSS`：看录像里 `(b)` 门口的 `+` 十字在 `TURN_TO_INNER` 时实际落到哪个 `x` 区间，微调 `TO_INNER_CROSS_MIN_X` / `TO_INNER_CROSS_MAX_X`（当前 `135..255`）。
-   - `STOP:NO B RING`：看 `map_last_run.txt` 的 `cross_steps` 与 `cross_hits`，若还没走到 `(b)` 清晰区就用完步数，可调大 `CROSS_STEP_MS`（当前 `520`）或 `CROSS_STEP_LIMIT`（当前 `7`）。
-   - `STOP:NO OUT LN`：看 `RETURN_OUT_CROSS` 画面里外轨出现位置，核对 `RETURN_OUT_TURN_DEG`（当前 `160.0`）是否正朝南以及 `RETURN_OUT_RAIL_Y`（当前 `210`）。
-   - `STOP:NO HOME` / `HOME ALIGN` / `NO HOME BOX`：切 `TEST_STAGE = "HOME_RETURN_TEST"` 在 `HOME` 西侧外轨快速复测 `5` 秒，按转正后画面微调 `HOME_BRANCH_ADVANCE_CM`（当前 `42.0`）或 `HOME_TURN_DEG`（当前 `90.0`）。
-   - **`STOP:HOME CHECK`（说明已经真开进 `HOME` 框了！）**：看手机俯拍确认整车是否完全在 `320×320 mm` 方框内，读取此时 OpenMV 终端日志里的 `box_y=<数值>`，把该数值填进第 213 行 **`HOME_PARK_STOP_Y = <数值>`**，之后成功停入即显示 **`STOP:DONE HOME`** 并亮绿灯！
-
-### 第二阶段：向多块搬运与高分冲刺（时间充裕时）
-1. **压缩对位耗时**：`ALIGN_B_RING` 实测单块约 `15–20 s`；若冲多块，可继续观察 `B_RING_FAR_STEP_MS (560)` / `B_RING_MID_STEP_MS (365)` 并在确认不超调后适当减小停稳帧数。
-2. **5 色全覆盖**：红/蓝/绿/黑已开启；若需抓白圆柱，先在空场地垫上单独开 `ENABLE_WHITE = True` 跑一圈确认 `detect_white_cyl` 不误报地垫褶皱。
-3. **多靶位规划（`a–e`）**：官方赛规任意圆柱放任意靶位均得分，且**未回 `HOME` 停车总分 ×0.5**。建议确保 **1 块 + 回 `HOME` 100% 稳过**后，再从 `(b)` 拓展到 2–3 块（按由远及近顺序放置，避免已放物块挡路，并监控总赛时留足最后 20 秒回 `HOME`）。
+### 4.3 脱机日志与停机码速查（`F:\map_last_run.txt`）
+每次运行结束自动写入 OpenMV U 盘 `F:\map_last_run.txt`（例：`rev=09-1127A stage=... stop=... ring=... walls=... back_y=... tilt=... anchor=...`）：
+- **绿灯常亮** = 成功：`DONE HOME` / `PLACED` / `EXIT OK` / `B AIM READY`。
+- **蓝灯闪烁** = `WAIT_KEY1` 待机按 `Key1` 启动；**青灯常亮** = 机械臂 7 步动作中。
+- **红蓝快闪** = 保护刹停，按 `STOP:xxx` 排查：
+  - `NO HOME X`：出 HOME 超时未见 E4（检查白底阈值或起点是否偏离 HOME 框太多）。
+  - `NO B TARGET` / `NO B RING`：抓完进内圈未见 `(b)` `+` 或靶环（核对 `TO_INNER_CROSS_MIN_X..MAX_X = 155..295`）。
+  - `NO OUT RAIL` / `JOIN CW TO`：放完 `(b)` 上北外轨超时（核对 `NW_TURN_MS = 450` 是否正对北直道）。
+  - `NO HOME` / `NO HOME WALL` / `HOME ALIGN`：回 HOME 阶段异常（切 `HOME_LEFT_TEST` 5 秒定位，核对 `HOME_WALL2_ADVANCE_CM = 10.0`）。
+  - `ARM TO` / `LINK LOST`：机械臂超时或 STM32 断链（检查电池电量与 P4/P5 串口线）。
 
 ---
 
-## 7. 避坑清单（前 21 次实测踩过的坑）
+## 5. 前 29 次实测踩过的血泪避坑清单（接手人与 AI 必看）
 
-1. **电池电量会明显改变所有开环转向角**：满电时 `wz=640 × 1300ms = 90°`，低电时同样时间可能只转 `70°`。凡是关键转弯优先用视觉地标闭环（如 `HOME_FIND_CROSS`、`TURN_TO_INNER`），**比赛/联调前务必保持满电**。
-2. **严禁先画 Debug 标记再跑检测**：所有 `img.draw_*` 必须放在 `detect_line / detect_cylinder / detect_cross / detect_b_ring / detect_home_branch / detect_home_box` 全部执行之后。
-3. **垫外暗地砖反光极易造成单边阶跃误检**：检测外轨横线和 `HOME` 侧边线时，**必须验证黑线前后/上下两侧都是亮白垫**（`min(...)`），不能用单侧 `max(...)`。
-4. **不要把 `scan_b_ring` 做得过重**：OpenMV MicroPython 像素循环很吃 CPU，`wide_acquire` 单帧耗时接近 `0.8 s`；后续优化视觉时务必注意帧率，避免超过 STM32 `280 ms` 速度看门狗或 `700 ms` 断联门限。
-5. **脱机测试前一定核对版本号**：曾出现 IDE 里改了代码但 OpenMV 脱机跑的还是旧 `F:\main.py` 的情况，务必看 HUD 右上角 `RUN_REV` 和 `F:\map_last_run.txt` 的 `rev=` 字段确认已刷新。
-6. **多智能体协作说明**：本仓库使用 `mcp-agent-mail` + `memory` 同步进度（详见项目规则），若队友继续借助 AI 协作，修改共享代码前请留意最新 `07_comp_map.py` 与 `git log`。
+1. **阴影侧白垫灰度只有 `114–122`**：靠白墙（北侧 `(b)` 区域）处于阴影，旧代码 `_is_cross_ring16` 写死 `hi >= 135` 会把 `(b)` 旁所有真 `+` 杀光！必须保持 **`hi >= 85` + 相对对比度 `(hi - base) >= 24`**。
+2. **旋转时 `+` 歪 `20°–35°` 会压住外接框对角**：旧的“四角白底”十字检测在旋转中必漏检；必须坚持用 **16 点椭圆环 `_is_cross_ring16`（`runs == 4`）**，对 `0°–45°` 任意倾角不变且严格拒绝斜直线/T 口/L 角。
+3. **出 HOME 绝不能只认孤立 `+`**：在 `HOME` 里左转 `~30°` 时会先扫过**内岛干扰 `+`**（`test27` 连踩 3 次掉进内圈）。必须坚持 **E3（双轨夹 `+`）/ E4（最左外轨竖立 + `+` 在外轨右侧）** 复合地标。
+4. **近景直行外轨透视斜角可达 `56°–60°`**：锁线角度上限必须放宽到 **`<= 65°`**（`test26` 和 `test29` 实测 `56.0° / 59.4°`，卡死 `50°` 会漏锁）。
+5. **走廊地砖顶灯反光可亮到 `170–190`**：回 HOME 面对走廊时，后边线上方地砖反光几乎和白垫一样亮（`test28 00:24`），绝对不能用 `above_g <= 145` 过滤；必须保留抗反光版 `detect_home_back_wall`（结合 `y=65..114` 墙/门暗度 + 最远笔直黑边线）。
+6. **`HOME` 门口宽 `32 cm` 超出近端视场**：站在 `HOME` 门口时左右两堵侧墙同时在画面里放不下（`test22 00:13`），绝不能退回双侧墙 `detect_home_box` 做门口转向锁。
+7. **底边找 HOME 时必须关闭 `OUTER_RECOVER` 和 `prefer_leftmost`**：否则左侧 `HOME` 边框和“二维码”线会被误判为“左侧外轨”，触发连续左跳（`test22` 曾触发 `shifts=9`）。
+8. **电池管理**：比赛尽量保持每次上场电量在 **`11.6–12.3V`** 区间（低于 `11.4V` 换电），并切记 OpenMV 脱机跑的永远是 `F:\main.py`，改完代码务必刷入并核对 HUD `RUN_REV`。
+9. **无场地离线验证方法**：本地 Python 环境已装 `imageio_ffmpeg + PIL + numpy`，AI 可直接解码 `openmv/test*.mp4`（剥离 `y=152/172/192` 的 1 px 灰色叠画扫描线）把改动后的检测函数对真实赛场录像逐帧跑回归测试，确认 0 回归后再上真车。
