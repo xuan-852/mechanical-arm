@@ -31,7 +31,7 @@ REQUIRE_KEY1            = True
 #   "B_RING_TEST"     : face (b) inside the inner oval -> test final visual alignment only
 #   "B_PICK_PLACE"     : HOME -> Pick -> Put (b), then stop
 TEST_STAGE              = "FULL_1_BLOCK"
-RUN_REV                 = "07-1126D"
+RUN_REV                 = "07-1126E"
 RUN_SUMMARY_FILE        = "map_last_run.txt"
 
 # Route planner: tuple of inner-bottom '+' cross indices to visit (1=(b), 2=(d), 3=(e))
@@ -39,16 +39,16 @@ RUN_SUMMARY_FILE        = "map_last_run.txt"
 TARGET_CROSS_ORDER      = (1,)
 RETURN_TO_HOME          = True     # True = avoid 0.5x missing-HOME penalty after last put
 
-# --- Edge 0: HOME -> OUTER_WEST (verified double-1000 exit, then align to roadway '+' cross) ---
-HOME_PRE_TURN_MS        = 1000     # Spin CCW left inside HOME (verified double-1000 step 1)
-HOME_PRE_TURN_WZ        = 540
-HOME_EXIT_MS            = 1000     # Diagonal exit out of HOME (verified double-1000 step 2)
-HOME_EXIT_VX            = 580
-HOME_EXIT_WZ            = 60
-HOME_CROSS_TURN_WZ      = 480      # Gentle CCW left spin after double-1000 until roadway '+' centers
-HOME_CROSS_SLOW_WZ      = 360      # Slow down once near '+' enters view so it never slips past in 1 frame
-HOME_CROSS_TURN_MAX_MS  = 1500     # Hard fail-stop if roadway '+' cross not found after exiting HOME
-HOME_CROSS_MIN_BOT_Y    = 148      # Near roadway '+' only (test12 00:11-12 sits at y=154..167)
+# --- Edge 0: HOME -> OUTER_WEST (closed-loop '+' lock while moving, battery-voltage immune) ---
+HOME_PRE_TURN_MS        = 550      # Short safe CCW pre-turn (~35-42 deg full bat / ~25 deg low bat; never overshoots '+')
+HOME_PRE_TURN_WZ        = 420
+HOME_EXIT_MS            = 850      # Max diagonal exit out of HOME; cuts short IMMEDIATELY once roadway '+' appears
+HOME_EXIT_VX            = 540
+HOME_EXIT_WZ            = 0
+HOME_CROSS_TURN_WZ      = 380      # Gentle blur-free CCW sweep when '+' not yet visible
+HOME_CROSS_SLOW_WZ      = 280      # Bidirectional fine turn toward visible '+' while rotating
+HOME_CROSS_TURN_MAX_MS  = 2400     # Generous timeout for low battery too
+HOME_CROSS_MIN_BOT_Y    = 145      # Near roadway '+' only (rejects far horizon crosses)
 HOME_CROSS_MIN_X        = 75       # Confirm exit once roadway '+' moves into front-center window
 HOME_CROSS_MAX_X        = 255
 HOME_CROSS_CONFIRM      = 2
@@ -123,7 +123,7 @@ DRIVE_CAL_VX            = 560
 DRIVE_DEADBAND_MS       = 112
 SPEED_CM_PER_S_560      = 16.0
 TURN_CAL_WZ             = 640
-TURN_90_MS_640          = 1300
+TURN_90_MS_640          = 900      # Recalibrated from test24 full-battery (~105 deg/s); closed-loop MAX_DEG covers low bat
 
 
 def cm_to_ms(cm):
@@ -141,9 +141,10 @@ def deg_to_ms(deg):
 # --- Edge 2: OUTER_WEST -> INNER_BOT rail (visual line capture + measured angle) ---
 # WZ sign convention (verified zmotord.c): +1 = CCW left turn, -1 = CW right turn
 TO_INNER_WZ_SIGN        = -1       # -1 CW turn inward from outer oval toward (b) '+' cross
-TO_INNER_SLOW_WZ        = 400      # Slow CW spin once near (b) '+' enters from right
-TO_INNER_MIN_DEG        = 55.0     # Ignore outer oval before turning North
-TO_INNER_MAX_DEG        = 175.0    # Hard fail-stop if (b) '+' cross not found (extra headroom for low battery)
+TO_INNER_TURN_WZ        = 460      # Gentle CW spin for blur-free '+' detection while rotating
+TO_INNER_SLOW_WZ        = 300      # Bidirectional fine turn once near (b) '+' enters view
+TO_INNER_MIN_DEG        = 35.0     # Ignore outer oval briefly, then start locking '+' while turning
+TO_INNER_MAX_DEG        = 220.0    # Hard fail-stop if (b) '+' cross not found (generous for low battery)
 TO_INNER_CROSS_MIN_BOT_Y = 148     # Reject far horizon crosses
 TO_INNER_CROSS_MIN_X    = 135      # When (b) '+' sits in [135..255], (b) rings sit dead-center at x~130..165
 TO_INNER_CROSS_MAX_X    = 255
@@ -568,6 +569,43 @@ def detect_home_box(img):
     return None
 
 
+_RING16 = tuple(
+    (math.cos(i * math.pi / 8.0), math.sin(i * math.pi / 8.0)) for i in range(16)
+)
+
+
+def _is_cross_ring16(img, x, y, w, h):
+    """Rotation- and perspective-invariant '+' topology check using a 16-point ellipse ring.
+    A '+' at ANY spin angle (0..90 deg) has a dark center and exactly 4 dark arm runs separated
+    by 4 bright white pockets; lines/diagonals/L-corners have 2 runs, T-junctions have 3."""
+    cx, cy = x + w // 2, y + h // 2
+    arm_c = _px_gray(img, cx, cy)
+    if arm_c > 118:
+        return False
+    rx = max(4.0, 0.38 * w)
+    ry = max(3.5, 0.38 * h)
+    vals = []
+    for c_a, s_a in _RING16:
+        px = max(0, min(IMG_W - 1, int(round(cx + rx * c_a))))
+        py = max(0, min(IMG_H - 1, int(round(cy + ry * s_a))))
+        vals.append(_px_gray(img, px, py))
+    hi = max(vals)
+    lo = min(vals)
+    base = arm_c if arm_c > lo else lo
+    if hi < 135 or (hi - base) < 22:
+        return False
+    thr = min(130.0, 0.5 * (hi + base))
+    dark = [(v <= thr) for v in vals]
+    white_cnt = sum(1 for d in dark if not d)
+    if white_cnt < 4:
+        return False
+    runs = 0
+    for i in range(16):
+        if dark[i] and (not dark[(i - 1) & 15]):
+            runs += 1
+    return runs == 4
+
+
 def detect_cross(img, rail_pts=None, previous_box=None, allow_bottom_clip=False):
     """Find a '+' left of the fitted rail on search, then follow that marker."""
     if rail_pts is not None:
@@ -605,22 +643,7 @@ def detect_cross(img, rail_pts=None, previous_box=None, allow_bottom_clip=False)
             if max(dx, dy) > B_MARK_MAX_JUMP:
                 continue
             score = -(dx + dy)
-        left, right = x + w // 5, x + 4 * w // 5
-        top = y + (1 if h < 18 else h // 5)
-        bottom = min(IMG_H - 1, y + (h - 2 if h < 18 else 4 * h // 5))
-        c_top = y if h < 18 else top
-        c_bot = min(IMG_H - 1, (y + h - 1) if h < 18 else bottom)
-        arm_c = _px_gray(img, cx, cy)
-        arm_l = min(_px_gray(img, left, max(0, min(IMG_H - 1, cy + dy))) for dy in (-3, 0, 3))
-        arm_r = min(_px_gray(img, right, max(0, min(IMG_H - 1, cy + dy))) for dy in (-3, 0, 3))
-        arm_t = min(_px_gray(img, max(0, min(IMG_W - 1, cx + dx)), top) for dx in (-4, 0, 4))
-        arm_b = min(_px_gray(img, max(0, min(IMG_W - 1, cx + dx)), bottom) for dx in (-4, 0, 4))
-        arms_max = max(arm_c, arm_l, arm_r, arm_t, arm_b)
-        corners = sorted([
-            _px_gray(img, left, c_top), _px_gray(img, right, c_top),
-            _px_gray(img, left, c_bot), _px_gray(img, right, c_bot),
-        ])
-        if arms_max <= 110 and (corners[1] - arms_max) >= 22 and score > best_score:
+        if _is_cross_ring16(img, x, y, w, h) and score > best_score:
             best_box = (x, y, w, h)
             best_score = score
     return best_box
@@ -1105,7 +1128,7 @@ while True:
     if fsm_state in ("FOLLOW_OUTER_PICK", "ALIGN_PICK"):
         cyl_hit = detect_cylinder(img, FLOOR_ROI if fsm_state == "ALIGN_PICK" else TRIG_ROI)
     cross_box = None
-    if fsm_state in ("LEAVE_HOME", "HOME_FIND_CROSS", "TURN_TO_INNER"):
+    if fsm_state in ("WAIT_KEY1", "WAIT_ARM_WAKE", "HOME_PRE_TURN", "LEAVE_HOME", "HOME_FIND_CROSS", "TURN_TO_INNER"):
         cross_box = detect_cross(img, allow_bottom_clip=True)
     elif fsm_state == "FOLLOW_INNER_TARGET":
         cross_box = detect_cross(img, rail_pts=pts, previous_box=b_mark_box)
@@ -1314,14 +1337,28 @@ while True:
                     enter_timed_stage("HOME_PRE_TURN", now_ms)
 
         elif fsm_state == "HOME_PRE_TURN":
-            if time.ticks_diff(now_ms, t_stage_start) >= HOME_PRE_TURN_MS:
+            near_cross = (cross_box is not None and cross_bot >= HOME_CROSS_MIN_BOT_Y and
+                          45 <= cross_cx <= 275)
+            if near_cross:
+                # Roadway '+' already in view while rotating -> hand straight to closed-loop lock!
+                send_vel(0, 0, 0, 0)
+                print("HOME pre_turn early_cross=(%d,%d)" % (cross_cx, cross_bot))
+                enter_timed_stage("HOME_FIND_CROSS", now_ms)
+            elif time.ticks_diff(now_ms, t_stage_start) >= HOME_PRE_TURN_MS:
                 enter_timed_stage("LEAVE_HOME", now_ms)
             else:
                 wz_cmd = HOME_PRE_TURN_WZ
                 send_vel(0, 0, wz_cmd, 0)
 
         elif fsm_state == "LEAVE_HOME":
-            if time.ticks_diff(now_ms, t_stage_start) >= HOME_EXIT_MS:
+            near_cross = (cross_box is not None and cross_bot >= HOME_CROSS_MIN_BOT_Y and
+                          45 <= cross_cx <= 275)
+            if near_cross:
+                # Detect '+' while moving out of HOME -> stop immediately, never drive past it!
+                send_vel(0, 0, 0, 0)
+                print("HOME leave early_cross=(%d,%d)" % (cross_cx, cross_bot))
+                enter_timed_stage("HOME_FIND_CROSS", now_ms)
+            elif time.ticks_diff(now_ms, t_stage_start) >= HOME_EXIT_MS:
                 send_vel(0, 0, 0, 0)
                 enter_timed_stage("HOME_FIND_CROSS", now_ms)
             else:
@@ -1342,7 +1379,11 @@ while True:
                 fail_stop("NO HOME X")
             else:
                 turn_lock_streak = 0
-                wz_cmd = HOME_CROSS_SLOW_WZ if near_cross else HOME_CROSS_TURN_WZ
+                if near_cross:
+                    # Bidirectional closed-loop: steer toward '+' (right if cx>max, left if cx<min)
+                    wz_cmd = -HOME_CROSS_SLOW_WZ if cross_cx > HOME_CROSS_MAX_X else HOME_CROSS_SLOW_WZ
+                else:
+                    wz_cmd = HOME_CROSS_TURN_WZ
                 send_vel(0, 0, wz_cmd, 0)
 
         elif fsm_state == "FOLLOW_OUTER_PICK":
@@ -1428,8 +1469,11 @@ while True:
                 fail_stop("NO B CROSS")
             else:
                 turn_lock_streak = 0
-                wz_mag = TO_INNER_SLOW_WZ if (el >= deg_to_ms(TO_INNER_MIN_DEG) and near_cross) else TURN_CAL_WZ
-                wz_cmd = TO_INNER_WZ_SIGN * wz_mag
+                if el >= deg_to_ms(TO_INNER_MIN_DEG) and near_cross:
+                    # Bidirectional: if (b) '+' drifted left, steer CCW left; if right, steer CW right
+                    wz_cmd = TO_INNER_SLOW_WZ if cross_cx < TO_INNER_CROSS_MIN_X else -TO_INNER_SLOW_WZ
+                else:
+                    wz_cmd = TO_INNER_WZ_SIGN * TO_INNER_TURN_WZ
                 send_vel(0, 0, wz_cmd, 0)
 
         elif fsm_state == "CROSS_TO_INNER":
