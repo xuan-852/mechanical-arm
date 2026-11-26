@@ -31,17 +31,17 @@ TOL_Y_NEAR          = 236      # Must at least reach bottom edge (never grab unc
 TOL_Y_FAR           = 240      # Clamped at bottom border of 320x240 image
 MAX_CLIP_TOP_Y      = 192      # If bot_y>=238 and top_y>192, drove too far over cylinder -> back up
 
-# Cylinder color thresholds in CIE LAB (calibrated for dim indoor room & bright mat):
-#   R: Red cylinder (measured median L=22, a=33, b=21)
-#   B: Blue cylinder
-#   K: Black cylinder (enable only on bright white mat; keep False on dark indoor tiles)
+# Cylinder color thresholds in CIE LAB (calibrated on real mat R/B/G/K samples):
+#   R: Red    B: Blue    G: Green    K: Black (enable on white mat)
 ENABLE_RED          = True
 ENABLE_BLUE         = True
+ENABLE_GREEN        = True
 ENABLE_BLACK        = False
 
 THR_RED             = (10, 95, 18, 127, 0, 127)
 THR_BLUE            = (10, 90, -35, 35, -128, -18)
-THR_BLACK           = (0, 22, -16, 16, -16, 16)
+THR_GREEN           = (10, 85, -128, -14, 5, 127)
+THR_BLACK           = (0, 15, -14, 14, -14, 14)
 
 MIN_PIXELS          = 140
 MIN_AREA            = 180
@@ -234,6 +234,9 @@ def build_thresholds():
     if ENABLE_BLUE:
         thrs.append(THR_BLUE)
         labels.append("B")
+    if ENABLE_GREEN:
+        thrs.append(THR_GREEN)
+        labels.append("G")
     if ENABLE_BLACK:
         thrs.append(THR_BLACK)
         labels.append("K")
@@ -263,9 +266,8 @@ def detect_cylinder(img):
             continue
         if bot_y < MIN_BOT_Y:
             continue
-        ratio = float(bh) / float(max(1, bw))
-        min_ratio = 0.25 if bot_y >= 236 else 0.50
-        if ratio < min_ratio or ratio > 3.20:
+        sol = float(b.pixels()) / float(max(1, bw * bh))
+        if sol < 0.45:
             continue
         # Decode single-color blob label when code is a power of two
         code = b.code()
@@ -274,6 +276,10 @@ def detect_cylinder(img):
             if code == (1 << idx):
                 tag = lbl
                 break
+        ratio = float(bh) / float(max(1, bw))
+        min_ratio = 0.70 if tag == "K" else (0.25 if bot_y >= 236 else 0.50)
+        if (tag == "K" and bw > 95) or ratio < min_ratio or ratio > 3.20:
+            continue
         # Prefer closest foreground cylinder (highest bot_y, tie-break by area)
         score = bot_y * 1000 + min(999, b.pixels() // 20)
         if score > best_score:
