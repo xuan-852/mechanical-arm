@@ -44,7 +44,7 @@ TEST_STAGE               = "FULL_1_BLOCK"
 #   "FROM_B_OUTER_LOOP" : Start at (b) post-placement -> Stage 4 + Stage 5 return to HOME
 #   "HOME_LEFT_TEST"    : Start on bottom outer rail East of HOME facing West -> Stage 5 dock only
 
-RUN_REV                  = "09-1127A"
+RUN_REV                  = "09-1127B"
 RUN_SUMMARY_FILE         = "map_last_run.txt"
 
 # --- Measured chassis kinematics (floor + test24/test28/test29 verified) ---
@@ -114,11 +114,11 @@ OUTER_LOCK_INIT_CX       = 40.0
 
 # --- Stage 2: Outer-Rail Cylinder Pickup (R/B/G/K + optional W) ---
 MIN_TRACK_BEFORE_PICK_MS = 450
-TRIG_ROI                 = (0, 110, 320, 130)
+TRIG_ROI                 = (0, 124, 320, 116)  # Start at y=124 to exclude orange elevator walls (test30/31)
 TRIG_BOT_Y               = 168
 TRIG_MIN_W               = 20
 TRIG_MIN_H               = 24
-TRIG_FRAMES              = 2
+TRIG_FRAMES              = 3         # Raised from 2 to reject 2-frame bend shadows (test30 00:55)
 
 ENABLE_RED               = True
 ENABLE_BLUE              = True
@@ -132,7 +132,7 @@ THR_GREEN                = (10, 85, -128, -14, 5, 127)
 THR_BLACK                = (0, 15, -14, 14, -14, 14)
 THR_CROSS                = (0, 44, -18, 18, -18, 18)
 
-FLOOR_ROI                = (0, 110, 320, 130)
+FLOOR_ROI                = (0, 124, 320, 116)
 BLACK_ROI                = (0, 128, 320, 112)
 TARGET_CX                = 130       # Calibrated center under straight-ahead jaws
 TARGET_BOT_Y             = 239
@@ -460,14 +460,40 @@ def find_scanline_tapes(row):
     return tapes, wide_hit
 
 
-def detect_outer_line(img, anchor_cx, had_lock, prefer_leftmost=True):
+def detect_outer_line(img, anchor_cx, had_lock, prefer_leftmost=True, cyl_hint_q=None):
     """Outer-rail-priority line tracker for CW outer loop.
+    When cyl_hint_q is provided (a colored R/B/G cylinder sits on the outer rail, e.g. test30 01:10),
+    scan TOP-DOWN from the cylinder's base (y=152->172->192) and lock onto the black rail nearest
+    the cylinder so far-left mat borders / shoes can NEVER steal the lock!
     Set prefer_leftmost=False on HOME straight so HOME's outer border on left never steals lock."""
     pts = []
     any_wide = False
     parallel_left_cx = None
-    anchor = anchor_cx
 
+    if cyl_hint_q is not None:
+        # Top-down cylinder-anchored rail lock: start near cylinder base (y=152) and chain downward
+        anchor = cyl_hint_q
+        anchored = False
+        rev_pts = []
+        for cy_q, weight in reversed(SCAN_BANDS):
+            y = cy_q * 2
+            row = [_px_gray(img, xq * 2, y) for xq in range(LINE_W)]
+            tapes, wide = find_scanline_tapes(row)
+            if wide:
+                any_wide = True
+            if not tapes:
+                continue
+            cand = min(tapes, key=lambda t: abs(t[0] - anchor))
+            max_jump = 45.0 if not anchored else float(MAX_ANCHOR_JUMP)
+            if abs(cand[0] - anchor) <= max_jump:
+                anchor = cand[0]
+                anchored = True
+                rev_pts.append((cand[0], float(cy_q), weight))
+        if rev_pts:
+            rev_pts.reverse()  # Restore near->far order (pts[0] = y=192, pts[-1] = y=152)
+            return rev_pts, any_wide, None
+
+    anchor = anchor_cx
     for cy_q, weight in SCAN_BANDS:
         y = cy_q * 2
         row = [_px_gray(img, xq * 2, y) for xq in range(LINE_W)]
@@ -1265,12 +1291,28 @@ while True:
     cover_cnt = (cover_cnt + 1) if (st_roi.l_mean() <= COVER_STOP_L) else 0
 
     # --- 1. VISION PASS (strictly BEFORE any debug overlays on img) ---
+    # Detect cylinder FIRST so colored cylinders (R/B/G) anchor outer-rail tracking away from mat borders!
+    cyl_hit = None
+    if fsm_state in ("WAIT_KEY1", "HOME_FIND_CROSS", "FOLLOW_OUTER_PICK", "BRAKE_PICK", "ALIGN_PICK"):
+        cyl_roi = FLOOR_ROI if fsm_state in ("BRAKE_PICK", "ALIGN_PICK") else TRIG_ROI
+        cyl_hit = detect_cylinder(img, cyl_roi)
+    cyl_hint_q = (
+        (cyl_hit[0] / 2.0)
+        if (fsm_state in ("WAIT_KEY1", "HOME_FIND_CROSS", "FOLLOW_OUTER_PICK") and
+            cyl_hit is not None and cyl_hit[6] in ("R", "B", "G") and cyl_hit[2] >= 138)
+        else None
+    )
+
+    # In FOLLOW_OUTER_PICK, NEVER force leftmost jump once locked or when anchored to a colored cylinder
+    # (prevents test30 01:10 mat-border hijack on the far left!)
     prefer_left = fsm_state in (
         "WAIT_KEY1", "HOME_PRE_TURN", "LEAVE_HOME", "HOME_FIND_CROSS",
-        "FOLLOW_OUTER_PICK", "JOIN_OUTER_CW", "FOLLOW_OUTER_LOOP"
+        "JOIN_OUTER_CW", "FOLLOW_OUTER_LOOP"
     )
-    pts, any_wide, parallel_left_cx = detect_outer_line(img, last_cx, had_lock, prefer_leftmost=prefer_left)
-    if parallel_left_cx is not None and fsm_state in ("FOLLOW_OUTER_PICK", "FOLLOW_OUTER_LOOP"):
+    pts, any_wide, parallel_left_cx = detect_outer_line(
+        img, last_cx, had_lock, prefer_leftmost=prefer_left, cyl_hint_q=cyl_hint_q
+    )
+    if parallel_left_cx is not None and fsm_state == "FOLLOW_OUTER_LOOP":
         left_rail_streak += 1
         if left_rail_streak >= LEFT_OUTER_RECOVER_FRAMES:
             last_cx = parallel_left_cx
@@ -1317,11 +1359,6 @@ while True:
     e4_box = None
     if fsm_state in ("WAIT_KEY1", "HOME_PRE_TURN", "LEAVE_HOME", "HOME_FIND_CROSS"):
         s1_crosses, e3_box, e4_box = detect_stage1_events(img, pts, float(ang_out) if len(pts) >= 2 else None)
-
-    # Stage 2 detector
-    cyl_hit = None
-    if fsm_state in ("FOLLOW_OUTER_PICK", "ALIGN_PICK"):
-        cyl_hit = detect_cylinder(img, FLOOR_ROI if fsm_state == "ALIGN_PICK" else TRIG_ROI)
 
     # Stage 3 detectors ((b) cross + concentric (b) ring)
     b_cross = detect_b_cross(img) if fsm_state == "TURN_TO_INNER" else None
@@ -1497,13 +1534,12 @@ while True:
                 else:
                     enter_stage("HOME_PRE_TURN", now_ms)
 
-        # ---- STAGE 1: HOME EXIT -> OUTER_WEST (E3 -> E4 closed-loop) ----
+        # ---- STAGE 1: HOME EXIT -> OUTER_WEST (strict E4 outer-rail + right-'+' lock) ----
         elif fsm_state == "HOME_PRE_TURN":
-            if e3_box is not None:
-                saw_exit_e3 = True
-            if e4_box is not None or e3_box is not None:
+            if e4_box is not None:
+                # Only skip LEAVE_HOME if already aligned on outer rail with roadway '+' on right (test26)
                 send_vel(0, 0, 0, 0)
-                print("S1 pre_turn early e3=%s e4=%s" % (e3_box is not None, e4_box is not None))
+                print("S1 pre_turn early e4=%s" % (e4_box,))
                 enter_stage("HOME_FIND_CROSS", now_ms)
             elif time.ticks_diff(now_ms, t_stage_start) >= HOME_PRE_TURN_MS:
                 enter_stage("LEAVE_HOME", now_ms)
@@ -1512,11 +1548,10 @@ while True:
                 send_vel(0, 0, wz_cmd, 0)
 
         elif fsm_state == "LEAVE_HOME":
-            if e3_box is not None:
-                saw_exit_e3 = True
-            if e4_box is not None or e3_box is not None:
+            if e4_box is not None:
+                # Full-battery early arrival at E4 (test25 00:04) -> brake immediately, never drive past '+'
                 send_vel(0, 0, 0, 0)
-                print("S1 leave early e3=%s e4=%s" % (e3_box is not None, e4_box is not None))
+                print("S1 leave early e4=%s" % (e4_box,))
                 enter_stage("HOME_FIND_CROSS", now_ms)
             elif time.ticks_diff(now_ms, t_stage_start) >= HOME_EXIT_MS:
                 send_vel(0, 0, 0, 0)
@@ -1527,36 +1562,36 @@ while True:
 
         elif fsm_state == "HOME_FIND_CROSS":
             el = time.ticks_diff(now_ms, t_stage_start)
-            if e3_box is not None:
-                saw_exit_e3 = True
-            # Lock on Fig 4 (E4: leftmost outer rail + roadway '+' on right),
-            # OR fallback lock if Fig 3 (E3) already confirmed and outer rail is now cleanly centered
-            rail_centered_after_e3 = (
-                saw_exit_e3 and len(pts) >= 2 and line_valid == 1 and
-                abs(err_out) <= 280 and abs(ang_out) <= 50
+            # Lock onto outer rail via E4 (left outer rail + roadway '+' on right)
+            # OR directly via colored cylinder (R/B/G) sitting right on top of the outer rail!
+            cyl_rail_ok = (
+                cyl_hint_q is not None and 32.0 <= cyl_hint_q <= 130.0 and
+                len(pts) >= 2 and line_valid == 1 and
+                abs(pts[-1][0] - cyl_hint_q) <= 28.0 and abs(ang_out) <= HOME_E4_MAX_ANG
             )
-            if e4_box is not None or rail_centered_after_e3:
+            if e4_box is not None or cyl_rail_ok:
                 send_vel(0, 0, 0, 0)
                 turn_lock_streak += 1
                 if turn_lock_streak >= HOME_E4_CONFIRM:
-                    print("S1 locked e4=%s e3_fb=%d e=%d ang=%d el=%d" % (
-                        e4_box, int(rail_centered_after_e3), err_out, ang_out, el))
+                    print("S1 locked e4=%s cyl_rail=%d cx=%.1f e=%d ang=%d el=%d" % (
+                        e4_box, int(cyl_rail_ok), last_cx, err_out, ang_out, el))
                     if TEST_STAGE == "EXIT_TEST":
                         latch_stop("EXIT OK", now_ms)
                     else:
-                        reset_line_state(OUTER_LOCK_INIT_CX)
+                        # Preserve the exact locked rail position (anchored to cylinder/E4, NOT blind 40.0!)
+                        locked_cx = cyl_hint_q if cyl_hint_q is not None else last_cx
+                        reset_line_state(locked_cx)
+                        had_lock = True
                         enter_stage("FOLLOW_OUTER_PICK", now_ms)
             elif el >= HOME_CROSS_TURN_MAX_MS:
                 latch_stop("NO HOME X", now_ms)
             else:
                 turn_lock_streak = 0
-                # Overshoot self-rescue: if E3 already passed and outer rail slid far right, steer CW right back!
-                if saw_exit_e3 and ((line_valid >= 1 and err_out > 320) or (line_valid == 0 and last_dir > 0)):
-                    wz_cmd = -HOME_CROSS_SLOW_WZ
-                elif saw_exit_e3 or e3_box is not None:
-                    wz_cmd = HOME_CROSS_SLOW_WZ
-                else:
-                    wz_cmd = HOME_CROSS_TURN_WZ
+                left_cross_near = any(
+                    (b[0] + b[2] // 2) < 175 and (b[1] + b[3]) >= HOME_E3_MIN_BOT_Y
+                    for b in s1_crosses
+                )
+                wz_cmd = HOME_CROSS_SLOW_WZ if (e3_box is not None or left_cross_near or cyl_hint_q is not None) else HOME_CROSS_TURN_WZ
                 send_vel(0, 0, wz_cmd, 0)
 
         # ---- STAGE 2: OUTER RAIL TRACK -> ALIGN_PICK -> 7-STEP PICK ----
@@ -1592,10 +1627,15 @@ while True:
         elif fsm_state == "BRAKE_PICK":
             send_vel(0, 0, 0, 0)
             if time.ticks_diff(now_ms, t_pause_until) >= 0:
-                t_cyl_lost_start = None
-                settle_cnt = 0
-                t_pulse_done = 0
-                fsm_state = "ALIGN_PICK"
+                if cyl_hit is not None:
+                    t_cyl_lost_start = None
+                    settle_cnt = 0
+                    t_pulse_done = 0
+                    fsm_state = "ALIGN_PICK"
+                else:
+                    # Transient shadow/blur vanished after braking -> seamlessly resume outer tracking!
+                    cyl_trig_cnt = 0
+                    fsm_state = "FOLLOW_OUTER_PICK"
 
         elif fsm_state == "ALIGN_PICK":
             if cyl_hit is None:
